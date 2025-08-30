@@ -7,6 +7,7 @@ using Azure.Search.Documents.Models;
 using Microsoft.Extensions.Logging;
 using RagSearch.Models;
 using System.Text.Json;
+using AzureSearchDocument = Azure.Search.Documents.Models.SearchDocument;
 
 namespace RagSearch.Services;
 
@@ -81,7 +82,7 @@ public class AzureSearchService : ISearchService
                     new SimpleField("sourceType", SearchFieldDataType.String) { IsFilterable = true, IsFacetable = true },
                     new SearchableField("author") { IsSortable = false },
                     new SimpleField("language", SearchFieldDataType.String) { IsFilterable = true, IsFacetable = true },
-                    new SearchableField("keyPhrases") { IsCollection = true },
+                    new SearchField("keyPhrases", SearchFieldDataType.Collection(SearchFieldDataType.String)) { IsSearchable = true },
                     new SimpleField("hasImages", SearchFieldDataType.Boolean) { IsFilterable = true },
                     new SimpleField("imageCount", SearchFieldDataType.Int32) { IsFilterable = true },
                     new VectorSearchField("contentVector", EmbeddingDimensions, "my-vector-profile"),
@@ -132,7 +133,7 @@ public class AzureSearchService : ISearchService
     /// <summary>
     /// Indexes a single document with vector embeddings
     /// </summary>
-    public async Task<string> IndexDocumentAsync(SearchDocument document)
+    public async Task<string> IndexDocumentAsync(RagSearch.Models.SearchDocument document)
     {
         try
         {
@@ -146,7 +147,7 @@ public class AzureSearchService : ISearchService
             }
 
             // Upload to Azure AI Search
-            var indexDocuments = IndexDocuments.Upload(new[] { document });
+            var indexDocuments = IndexDocumentsBatch.Upload(new[] { document });
             var result = await _searchClient.IndexDocumentsAsync(indexDocuments);
 
             var indexResult = result.Value.Results.FirstOrDefault();
@@ -170,7 +171,7 @@ public class AzureSearchService : ISearchService
     /// <summary>
     /// Indexes multiple documents in batch with embeddings
     /// </summary>
-    public async Task<string[]> IndexDocumentsAsync(SearchDocument[] documents)
+    public async Task<string[]> IndexDocumentsAsync(RagSearch.Models.SearchDocument[] documents)
     {
         try
         {
@@ -217,7 +218,7 @@ public class AzureSearchService : ISearchService
             for (int i = 0; i < documentsWithEmbeddings.Length; i += batchSize)
             {
                 var batch = documentsWithEmbeddings.Skip(i).Take(batchSize).ToArray();
-                var indexDocuments = IndexDocuments.Upload(batch!);
+                var indexDocuments = IndexDocumentsBatch.Upload(batch!);
                 
                 var result = await _searchClient.IndexDocumentsAsync(indexDocuments);
                 
@@ -258,7 +259,7 @@ public class AzureSearchService : ISearchService
             _logger.LogInformation("Executing {SearchType} search for query: '{Query}'", 
                 request.SearchType, request.Query);
 
-            SearchResults<SearchDocument> searchResults;
+            SearchResults<AzureSearchDocument> searchResults;
 
             switch (request.SearchType)
             {
@@ -318,7 +319,7 @@ public class AzureSearchService : ISearchService
         {
             _logger.LogInformation("Deleting document '{DocumentId}' from Azure AI Search", documentId);
 
-            var deleteDocuments = IndexDocuments.Delete("id", new[] { documentId });
+            var deleteDocuments = IndexDocumentsBatch.Delete("id", new[] { documentId });
             var result = await _searchClient.IndexDocumentsAsync(deleteDocuments);
 
             var deleteResult = result.Value.Results.FirstOrDefault();
@@ -430,7 +431,7 @@ public class AzureSearchService : ISearchService
     /// <summary>
     /// Performs keyword-based search using Azure AI Search
     /// </summary>
-    private async Task<SearchResults<SearchDocument>> PerformKeywordSearchAsync(SearchRequest request)
+    private async Task<SearchResults<AzureSearchDocument>> PerformKeywordSearchAsync(SearchRequest request)
     {
         var searchOptions = new SearchOptions
         {
@@ -441,13 +442,13 @@ public class AzureSearchService : ISearchService
 
         ApplyFiltersToSearchOptions(searchOptions, request.Filters);
 
-        return await _searchClient.SearchAsync<SearchDocument>(request.Query, searchOptions);
+        return await _searchClient.SearchAsync<AzureSearchDocument>(request.Query, searchOptions);
     }
 
     /// <summary>
     /// Performs vector-based semantic search using Azure AI Search
     /// </summary>
-    private async Task<SearchResults<SearchDocument>> PerformVectorSearchAsync(SearchRequest request)
+    private async Task<SearchResults<AzureSearchDocument>> PerformVectorSearchAsync(SearchRequest request)
     {
         var queryEmbedding = await GenerateEmbeddingsAsync(request.Query);
         
@@ -475,13 +476,13 @@ public class AzureSearchService : ISearchService
 
         ApplyFiltersToSearchOptions(searchOptions, request.Filters);
 
-        return await _searchClient.SearchAsync<SearchDocument>("*", searchOptions);
+        return await _searchClient.SearchAsync<AzureSearchDocument>("*", searchOptions);
     }
 
     /// <summary>
     /// Performs hybrid search combining keyword and vector search
     /// </summary>
-    private async Task<SearchResults<SearchDocument>> PerformHybridSearchAsync(SearchRequest request)
+    private async Task<SearchResults<AzureSearchDocument>> PerformHybridSearchAsync(SearchRequest request)
     {
         var queryEmbedding = await GenerateEmbeddingsAsync(request.Query);
         
@@ -511,7 +512,7 @@ public class AzureSearchService : ISearchService
 
         ApplyFiltersToSearchOptions(searchOptions, request.Filters);
 
-        return await _searchClient.SearchAsync<SearchDocument>(request.Query, searchOptions);
+        return await _searchClient.SearchAsync<AzureSearchDocument>(request.Query, searchOptions);
     }
 
     /// <summary>
@@ -571,31 +572,33 @@ public class AzureSearchService : ISearchService
     /// <summary>
     /// Converts Azure AI Search result to our SearchResult model
     /// </summary>
-    private static SearchResult ConvertToSearchResult(SearchResult<SearchDocument> searchResult)
+    private static SearchResult ConvertToSearchResult(SearchResult<AzureSearchDocument> searchResult)
     {
         var document = searchResult.Document;
         
         return new SearchResult
         {
             Score = searchResult.Score ?? 0,
-            Type = document.ContentType,
-            Summary = document.Summary,
-            Url = document.Url,
+            Type = document.GetString("contentType") ?? string.Empty,
+            Summary = document.GetString("summary") ?? string.Empty,
+            Url = document.GetString("url") ?? string.Empty,
             Content = new SearchResultContent
             {
-                Text = document.Content,
+                Text = document.GetString("content"),
                 Metadata = new SearchResultMetadata
                 {
-                    Title = document.Title,
-                    Author = document.Author,
-                    Created = document.Created,
-                    Modified = document.Modified,
-                    FileSize = document.FileSize,
-                    ContentType = document.ContentType,
-                    SourceContainer = document.SourceContainer,
-                    SourceType = document.SourceType,
-                    Language = document.Language,
-                    KeyPhrases = document.KeyPhrases
+                    Title = document.GetString("title"),
+                    Author = document.GetString("author"),
+                    Created = document.GetDateTimeOffset("created")?.DateTime,
+                    Modified = document.GetDateTimeOffset("modified")?.DateTime,
+                    FileSize = document.GetInt64("fileSize"),
+                    ContentType = document.GetString("contentType"),
+                    SourceContainer = document.GetString("sourceContainer"),
+                    SourceType = document.GetString("sourceType"),
+                    Language = document.GetString("language"),
+                    KeyPhrases = document.TryGetValue("keyPhrases", out var keyPhrasesObj) && keyPhrasesObj is IEnumerable<object> keyPhrases
+                        ? keyPhrases.Select(x => x?.ToString()).Where(x => !string.IsNullOrEmpty(x)).Cast<string>().ToArray()
+                        : null
                 }
             }
         };
