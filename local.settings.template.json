@@ -1,0 +1,25 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
+    
+    "# Search Service Configuration": "# Choose 'azure-search' or 'simplified'",
+    "SEARCH_SERVICE_TYPE": "simplified",
+    
+    "# Azure AI Search Configuration": "# Required when SEARCH_SERVICE_TYPE=azure-search",
+    "AZURE_SEARCH_SERVICE_ENDPOINT": "https://your-search-service.search.windows.net",
+    "AZURE_SEARCH_API_KEY": "your-search-service-api-key",
+    "AZURE_SEARCH_INDEX_NAME": "ragsearch-documents",
+    
+    "# Azure AI Services Configuration": "# Required for document processing",
+    "AZURE_AI_SERVICES_ENDPOINT": "https://your-ai-services.cognitiveservices.azure.com",
+    "AZURE_AI_SERVICES_API_KEY": "your-ai-services-api-key",
+    
+    "# Azure OpenAI Configuration": "# Required for embeddings and vector search",
+    "AZURE_OPENAI_ENDPOINT": "https://your-openai-service.openai.azure.com/",
+    "AZURE_OPENAI_API_KEY": "your-openai-api-key",
+    "AZURE_OPENAI_DEPLOYMENT_NAME": "text-embedding-3-small"
+  }
+}
