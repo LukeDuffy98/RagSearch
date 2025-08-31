@@ -7,6 +7,7 @@ using System.Net;
 using System.Text.Json;
 using Microsoft.Azure.WebJobs.Extensions.OpenApi.Core.Attributes;
 using Microsoft.OpenApi.Models;
+using System.Text.RegularExpressions;
 
 namespace RagSearch.Functions;
 
@@ -253,6 +254,43 @@ public class IndexTestFunction
                 return errorResponse;
             }
 
+        // Extract image URLs from HTML content if present
+            var imageUrls = new List<string>();
+    var imagesDetailed = new List<ImageInfo>();
+            var imageAltText = new Dictionary<string, string>();
+            var childDocs = new List<SearchDocument>();
+            if (!string.IsNullOrWhiteSpace(customDoc.Content))
+            {
+                try
+                {
+                    var rx = new Regex("<img[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+                    var matches = rx.Matches(customDoc.Content);
+                    foreach (Match m in matches)
+                    {
+                        var tag = m.Value;
+                        // Extract src
+                        var srcMatch = Regex.Match(tag, "src=\"(?<v>[^\"]+)\"", RegexOptions.IgnoreCase);
+                        if (!srcMatch.Success) continue;
+                        var src = srcMatch.Groups["v"].Value;
+                        if (string.IsNullOrWhiteSpace(src)) continue;
+                        // Extract alt if present
+                        var altMatch = Regex.Match(tag, "alt=\"(?<v>[^\"]*)\"", RegexOptions.IgnoreCase);
+                        if (altMatch.Success)
+                        {
+                            imageAltText[src] = altMatch.Groups["v"].Value;
+                        }
+                        // Make absolute URL if needed
+                        if (!Uri.TryCreate(src, UriKind.Absolute, out var abs) && !string.IsNullOrWhiteSpace(customDoc.Url))
+                        {
+                            if (Uri.TryCreate(new Uri(customDoc.Url), src, out var combined))
+                src = combined.ToString();
+                        }
+            imageUrls.Add(src);
+                    }
+                }
+                catch { }
+            }
+
             // Create the search document
             var document = new SearchDocument
             {
@@ -270,12 +308,96 @@ public class IndexTestFunction
                 Author = customDoc.Author ?? "Unknown",
                 Language = "en",
                 KeyPhrases = ExtractKeyPhrases(customDoc.Content),
-                HasImages = false,
-                ImageCount = 0
+                HasImages = imageUrls.Count > 0,
+                ImageCount = imageUrls.Count,
+                Metadata = imageUrls.Count > 0 ? JsonSerializer.Serialize(new { images = imageUrls }) : null
             };
+
+            // If we found image URLs, try to fetch lightweight metadata and add imagesDetailed
+            if (imageUrls.Count > 0)
+            {
+                int i = 0;
+                foreach (var url in imageUrls)
+                {
+                    try
+                    {
+                        using var http = new HttpClient();
+                        using var reqMsg = new HttpRequestMessage(HttpMethod.Head, url);
+                        using var head = await http.SendAsync(reqMsg);
+                        string? contentType = head.Content.Headers.ContentType?.MediaType;
+                        long? size = head.Content.Headers.ContentLength;
+
+                        string? ocrPreview = null; // We don't download bodies here to keep it light
+
+                        // Heuristic caption and keywords
+                        string? alt = imageAltText.TryGetValue(url, out var a) ? a : null;
+                        string? caption = !string.IsNullOrWhiteSpace(alt) ? alt : InferCaptionFromUrl(url);
+                        var keywords = InferKeywords(alt, contentType, url);
+
+                        imagesDetailed.Add(new ImageInfo
+                        {
+                            Id = Guid.NewGuid().ToString("n"),
+                            Url = url,
+                            ContentType = contentType,
+                            FileSize = size,
+                            Caption = caption,
+                            Keywords = keywords,
+                            OcrPreview = ocrPreview,
+                            ParentId = document.Id,
+                            ParentUrl = document.Url
+                        });
+
+                        // Create a child image document for indexing
+                        var imgDoc = new SearchDocument
+                        {
+                            Id = $"{document.Id}#img-{++i}",
+                            Title = !string.IsNullOrWhiteSpace(alt) ? alt : $"Image {i} - {document.Title}",
+                            Content = alt ?? string.Empty,
+                            Summary = !string.IsNullOrWhiteSpace(alt) ? alt : (caption ?? "Image referenced by parent document"),
+                            ContentType = "image",
+                            FileType = InferFileTypeFromUrlOrContentType(url, contentType),
+                            Created = DateTime.UtcNow,
+                            Modified = DateTime.UtcNow,
+                            FileSize = size ?? 0,
+                            Url = url,
+                            SourceType = "url",
+                            Author = document.Author,
+                            Language = document.Language,
+                            KeyPhrases = null,
+                            HasImages = false,
+                            ImageCount = 0,
+                            ImageCaption = caption,
+                            ImageKeywords = keywords,
+                            Metadata = JsonSerializer.Serialize(new { parentId = document.Id, parentUrl = document.Url, caption, keywords })
+                        };
+                        childDocs.Add(imgDoc);
+                    }
+                    catch
+                    {
+                        // Ignore failures; we still return the URL
+                        // On failure, still add a minimal record with inferred caption
+                        var alt2 = imageAltText.TryGetValue(url, out var a2) ? a2 : null;
+                        imagesDetailed.Add(new ImageInfo { Url = url, ParentId = document.Id, ParentUrl = document.Url, Caption = !string.IsNullOrWhiteSpace(alt2) ? alt2 : InferCaptionFromUrl(url), Keywords = InferKeywords(alt2, null, url) });
+                    }
+                }
+
+                // Merge into metadata
+                try
+                {
+                    var metaAnon = new { images = imageUrls, imagesDetailed = imagesDetailed };
+                    document.Metadata = JsonSerializer.Serialize(metaAnon);
+                }
+                catch { }
+            }
 
             // Index the document
             var indexedId = await _searchService.IndexDocumentAsync(document);
+
+            // Index child image documents if any
+            if (childDocs.Count > 0)
+            {
+                try { await _searchService.IndexDocumentsAsync(childDocs.ToArray()); } catch { }
+            }
 
             var result = new
             {
@@ -304,7 +426,7 @@ public class IndexTestFunction
 
             return response;
         }
-        catch (Exception ex)
+    catch (Exception ex)
         {
             _logger.LogError(ex, "Error adding custom URL document to search index");
             var errorResponse = req.CreateResponse(HttpStatusCode.InternalServerError);
@@ -313,11 +435,68 @@ public class IndexTestFunction
         }
     }
 
+    private static string? InferCaptionFromUrl(string url)
+    {
+        try
+        {
+            var uri = new Uri(url);
+            var name = System.IO.Path.GetFileNameWithoutExtension(uri.AbsolutePath);
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            name = name.Replace('-', ' ').Replace('_', ' ');
+            return System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(name);
+        }
+        catch { return null; }
+    }
+
+    private static string[]? InferKeywords(string? alt, string? contentType, string url)
+    {
+        var tokens = new List<string>();
+        if (!string.IsNullOrWhiteSpace(alt)) tokens.AddRange(Tokenize(alt));
+        if (!string.IsNullOrWhiteSpace(contentType)) tokens.AddRange(Tokenize(contentType));
+        try
+        {
+            var uri = new Uri(url);
+            tokens.AddRange(Tokenize(System.IO.Path.GetFileNameWithoutExtension(uri.AbsolutePath)));
+            var segs = uri.Segments?.Select(s => s.Trim('/')).Where(s => !string.IsNullOrWhiteSpace(s)).ToArray();
+            if (segs != null) tokens.AddRange(segs.SelectMany(Tokenize));
+        }
+        catch { }
+        var kws = tokens.Select(t => t.Trim().ToLowerInvariant())
+                        .Where(t => t.Length >= 3)
+                        .Distinct()
+                        .Take(8)
+                        .ToArray();
+        return kws.Length > 0 ? kws : null;
+    }
+
+    private static IEnumerable<string> Tokenize(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) yield break;
+        foreach (var part in Regex.Split(s, "[^A-Za-z0-9]+").Where(p => !string.IsNullOrWhiteSpace(p)))
+            yield return part;
+    }
+
     private string GenerateSummary(string content)
     {
         // Simple summary generation - take first 150 characters
         if (string.IsNullOrEmpty(content)) return "";
         return content.Length > 150 ? content[..150] + "..." : content;
+    }
+
+    private static string InferFileTypeFromUrlOrContentType(string url, string? contentType)
+    {
+        try
+        {
+            var ext = System.IO.Path.GetExtension(new Uri(url).AbsolutePath).Trim('.').ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(ext)) return ext;
+        }
+        catch { }
+        return contentType switch
+        {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            _ => "image"
+        };
     }
 
     private string[] ExtractKeyPhrases(string content)

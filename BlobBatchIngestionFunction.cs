@@ -7,6 +7,7 @@ using Microsoft.Azure.WebJobs.Extensions.OpenApi.Core.Attributes;
 using Microsoft.Extensions.Logging;
 using RagSearch.Models;
 using RagSearch.Services;
+using System.Text.RegularExpressions;
 
 namespace RagSearch.Functions;
 
@@ -56,11 +57,11 @@ public class BlobBatchIngestionFunction
             var allow = new HashSet<string>(options.AllowedExtensions ?? new[] { ".pdf", ".docx", ".pptx", ".txt", ".png", ".jpg", ".jpeg" }, StringComparer.OrdinalIgnoreCase);
 
             var container = _blobServiceClient.GetBlobContainerClient(options.Container);
-            if (!await container.ExistsAsync())
+            var createResponse = await container.CreateIfNotExistsAsync();
+            bool containerCreated = createResponse != null; // null means already existed
+            if (containerCreated)
             {
-                resp.StatusCode = HttpStatusCode.BadRequest;
-                await resp.WriteStringAsync($"Container '{options.Container}' does not exist.");
-                return resp;
+                _logger.LogInformation("Created source container '{Container}' for ingestion", options.Container);
             }
 
             await _searchService.EnsureIndexExistsAsync();
@@ -97,13 +98,27 @@ public class BlobBatchIngestionFunction
                 var processedDoc = await _docProcessor.ProcessAsync(docToIndex);
 
                 // Convert to SearchDocument for indexing
+                var imagesList = new List<string>();
+                var imagesDetailed = new List<object>();
+                bool isImage = string.Equals(docToIndex.FileType, "png", StringComparison.OrdinalIgnoreCase) ||
+                               string.Equals(docToIndex.FileType, "jpg", StringComparison.OrdinalIgnoreCase) ||
+                               string.Equals(docToIndex.FileType, "jpeg", StringComparison.OrdinalIgnoreCase);
+                if (isImage)
+                {
+                    imagesList.Add(blob.Uri.ToString());
+                    // Heuristic caption/keywords from file name and content type
+                    var caption = InferCaptionFromBlobUrl(blob.Uri.ToString());
+                    var keywords = InferKeywordsFromBlob(blob);
+                    imagesDetailed.Add(new { url = blob.Uri.ToString(), contentType = docToIndex.ContentType, fileSize = docToIndex.FileSize, caption, keywords });
+                }
+
                 var sd = new SearchDocument
                 {
                     Id = docToIndex.Id,
                     Title = processedDoc.Title,
                     Content = processedDoc.ExtractedText,
                     Summary = processedDoc.Summary,
-                    ContentType = "text",
+                    ContentType = isImage ? "image" : "text",
                     FileType = docToIndex.FileType,
                     Created = docToIndex.Created,
                     Modified = docToIndex.Modified,
@@ -115,11 +130,16 @@ public class BlobBatchIngestionFunction
                     Author = processedDoc.Author,
                     Language = processedDoc.Language,
                     KeyPhrases = processedDoc.KeyPhrases,
-                    HasImages = string.Equals(docToIndex.FileType, "png", StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(docToIndex.FileType, "jpg", StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(docToIndex.FileType, "jpeg", StringComparison.OrdinalIgnoreCase),
-                    ImageCount = processedDoc.ExtractedImages?.Length ?? 0,
-                    Metadata = JsonSerializer.Serialize(docToIndex.AdditionalMetadata)
+                    HasImages = isImage,
+                    ImageCount = isImage ? 1 : (processedDoc.ExtractedImages?.Length ?? 0),
+                    ImageCaption = isImage ? InferCaptionFromBlobUrl(blob.Uri.ToString()) : null,
+                    ImageKeywords = isImage ? InferKeywordsFromBlob(blob) : null,
+                    Metadata = JsonSerializer.Serialize(new
+                    {
+                        images = imagesList.Count > 0 ? imagesList : null,
+                        imagesDetailed = imagesDetailed.Count > 0 ? imagesDetailed : null,
+                        original = docToIndex.AdditionalMetadata
+                    })
                 };
 
                 docsToIndex.Add(sd);
@@ -147,7 +167,8 @@ public class BlobBatchIngestionFunction
                 processed,
                 indexed,
                 container = options.Container,
-                prefix = options.Prefix
+                prefix = options.Prefix,
+                containerCreated
             }, new JsonSerializerOptions { WriteIndented = true }));
             return resp;
         }
@@ -172,5 +193,35 @@ public class BlobBatchIngestionFunction
             ".jpg" or ".jpeg" => "image/jpeg",
             _ => "application/octet-stream"
         };
+    }
+
+    // Local helpers for blob image caption/keywords
+    private static string? InferCaptionFromBlobUrl(string url)
+    {
+        try
+        {
+            var uri = new Uri(url);
+            var name = System.IO.Path.GetFileNameWithoutExtension(uri.AbsolutePath);
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            name = name.Replace('-', ' ').Replace('_', ' ');
+            return System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(name);
+        }
+        catch { return null; }
+    }
+
+    private static string[]? InferKeywordsFromBlob(BlobClient blob)
+    {
+        try
+        {
+            var uri = blob.Uri;
+            var tokens = new List<string>();
+            var name = System.IO.Path.GetFileNameWithoutExtension(uri.AbsolutePath);
+            if (!string.IsNullOrWhiteSpace(name)) tokens.AddRange(Regex.Split(name, "[^A-Za-z0-9]+").Where(p => !string.IsNullOrWhiteSpace(p)));
+            var segs = uri.Segments?.Select(s => s.Trim('/')).Where(s => !string.IsNullOrWhiteSpace(s)).ToArray();
+            if (segs != null) foreach (var seg in segs) tokens.AddRange(Regex.Split(seg, "[^A-Za-z0-9]+").Where(p => !string.IsNullOrWhiteSpace(p)));
+            var kws = tokens.Select(t => t.Trim().ToLowerInvariant()).Where(t => t.Length >= 3).Distinct().Take(8).ToArray();
+            return kws.Length > 0 ? kws : null;
+        }
+        catch { return null; }
     }
 }

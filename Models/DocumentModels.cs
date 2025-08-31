@@ -82,6 +82,15 @@ public class SearchDocument
     [JsonPropertyName("imageCount")]
     public int ImageCount { get; set; }
 
+    // First-class fields for image documents to enable server-side filtering
+    [SearchableField(IsFilterable = true)]
+    [JsonPropertyName("imageCaption")]
+    public string? ImageCaption { get; set; }
+
+    [SearchableField(IsFilterable = true, IsFacetable = true)]
+    [JsonPropertyName("imageKeywords")]
+    public string[]? ImageKeywords { get; set; }
+
     // Vector field for semantic search - this is stored persistently in Azure AI Search
     [VectorSearchField(VectorSearchDimensions = 1536, VectorSearchProfileName = "my-vector-profile")]
     [JsonPropertyName("contentVector")]

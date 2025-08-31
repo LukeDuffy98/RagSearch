@@ -85,6 +85,8 @@ public class AzureSearchService : ISearchService
                     new SearchField("keyPhrases", SearchFieldDataType.Collection(SearchFieldDataType.String)) { IsSearchable = true },
                     new SimpleField("hasImages", SearchFieldDataType.Boolean) { IsFilterable = true },
                     new SimpleField("imageCount", SearchFieldDataType.Int32) { IsFilterable = true },
+                    new SearchableField("imageCaption") { IsFilterable = true },
+                    new SearchField("imageKeywords", SearchFieldDataType.Collection(SearchFieldDataType.String)) { IsSearchable = true, IsFilterable = true, IsFacetable = true },
                     new VectorSearchField("contentVector", EmbeddingDimensions, "my-vector-profile"),
                     new SimpleField("metadata", SearchFieldDataType.String) { IsFilterable = false }
                 },
@@ -440,7 +442,7 @@ public class AzureSearchService : ISearchService
             QueryType = SearchQueryType.Simple
         };
 
-        ApplyFiltersToSearchOptions(searchOptions, request.Filters);
+    ApplyFiltersToSearchOptions(searchOptions, request);
 
         return await _searchClient.SearchAsync<AzureSearchDocument>(request.Query, searchOptions);
     }
@@ -474,7 +476,7 @@ public class AzureSearchService : ISearchService
             }
         };
 
-        ApplyFiltersToSearchOptions(searchOptions, request.Filters);
+    ApplyFiltersToSearchOptions(searchOptions, request);
 
         return await _searchClient.SearchAsync<AzureSearchDocument>("*", searchOptions);
     }
@@ -510,7 +512,7 @@ public class AzureSearchService : ISearchService
             }
         };
 
-        ApplyFiltersToSearchOptions(searchOptions, request.Filters);
+    ApplyFiltersToSearchOptions(searchOptions, request);
 
         return await _searchClient.SearchAsync<AzureSearchDocument>(request.Query, searchOptions);
     }
@@ -518,28 +520,54 @@ public class AzureSearchService : ISearchService
     /// <summary>
     /// Applies filters to Azure AI Search options
     /// </summary>
-    private static void ApplyFiltersToSearchOptions(SearchOptions searchOptions, SearchFilters? filters)
+    private static void ApplyFiltersToSearchOptions(SearchOptions searchOptions, SearchRequest request)
     {
-        if (filters == null) return;
-
+        var filters = request.Filters;
         var filterExpressions = new List<string>();
 
-        if (!string.IsNullOrEmpty(filters.FileType))
+        // Content types: restrict to text/image types if provided
+        if (request.ContentTypes?.Length > 0)
+        {
+            // Treat "image" as contentType starting with image/
+            var typeExprs = new List<string>();
+            foreach (var t in request.ContentTypes)
+            {
+                if (string.Equals(t, "image", StringComparison.OrdinalIgnoreCase))
+                {
+                    typeExprs.Add("startswith(contentType, 'image/')");
+                }
+                else if (string.Equals(t, "text", StringComparison.OrdinalIgnoreCase))
+                {
+                    // allow common textual docs by excluding pure image binaries
+                    typeExprs.Add("not startswith(contentType, 'image/')");
+                }
+                else
+                {
+                    typeExprs.Add($"contentType eq '{t}'");
+                }
+            }
+            if (typeExprs.Count > 0)
+            {
+                filterExpressions.Add($"(" + string.Join(" or ", typeExprs) + ")");
+            }
+        }
+
+        if (filters != null && !string.IsNullOrEmpty(filters.FileType))
         {
             filterExpressions.Add($"contentType eq '{filters.FileType}'");
         }
 
-        if (!string.IsNullOrEmpty(filters.SourceContainer))
+        if (filters != null && !string.IsNullOrEmpty(filters.SourceContainer))
         {
             filterExpressions.Add($"sourceContainer eq '{filters.SourceContainer}'");
         }
 
-        if (!string.IsNullOrEmpty(filters.SourceType))
+        if (filters != null && !string.IsNullOrEmpty(filters.SourceType))
         {
             filterExpressions.Add($"sourceType eq '{filters.SourceType}'");
         }
 
-        if (filters.DateRange != null)
+        if (filters != null && filters.DateRange != null)
         {
             if (filters.DateRange.From.HasValue)
             {
@@ -551,7 +579,7 @@ public class AzureSearchService : ISearchService
             }
         }
 
-        if (filters.FileSize != null)
+        if (filters != null && filters.FileSize != null)
         {
             if (filters.FileSize.Min.HasValue)
             {
@@ -561,6 +589,26 @@ public class AzureSearchService : ISearchService
             {
                 filterExpressions.Add($"fileSize le {filters.FileSize.Max.Value}");
             }
+        }
+
+        // Image-specific filters
+        if (filters?.HasImages == true)
+        {
+            filterExpressions.Add("hasImages eq true");
+        }
+
+        if (!string.IsNullOrWhiteSpace(filters?.ImageCaptionContains))
+        {
+            // Use contains on imageCaption
+            var val = filters!.ImageCaptionContains!.Replace("'", "''");
+            filterExpressions.Add($"contains(imageCaption, '{val}')");
+        }
+
+        if (filters?.ImageKeywordsAny != null && filters.ImageKeywordsAny.Length > 0)
+        {
+            // search.in for keywords matching any
+            var keywords = string.Join(",", filters.ImageKeywordsAny.Select(k => k.Replace("'", "''")));
+            filterExpressions.Add($"search.in(imageKeywords, '{keywords}', ',')");
         }
 
         if (filterExpressions.Count > 0)
@@ -575,6 +623,49 @@ public class AzureSearchService : ISearchService
     private static SearchResult ConvertToSearchResult(SearchResult<AzureSearchDocument> searchResult)
     {
         var document = searchResult.Document;
+        string? metadataJson = document.GetString("metadata");
+        string[]? images = null;
+        ImageInfo[]? imagesDetailed = null;
+        if (!string.IsNullOrWhiteSpace(metadataJson))
+        {
+            try
+            {
+                using var jsonDoc = JsonDocument.Parse(metadataJson);
+                if (jsonDoc.RootElement.TryGetProperty("images", out var imagesProp) && imagesProp.ValueKind == JsonValueKind.Array)
+                {
+                    var list = new List<string>();
+                    foreach (var el in imagesProp.EnumerateArray())
+                    {
+                        var s = el.GetString();
+                        if (!string.IsNullOrWhiteSpace(s)) list.Add(s);
+                    }
+                    images = list.Count > 0 ? list.ToArray() : null;
+                }
+
+                if (jsonDoc.RootElement.TryGetProperty("imagesDetailed", out var detProp) && detProp.ValueKind == JsonValueKind.Array)
+                {
+                    var list = new List<ImageInfo>();
+                    foreach (var el in detProp.EnumerateArray())
+                    {
+                        var info = new ImageInfo
+                        {
+                            Id = el.TryGetProperty("id", out var id) ? id.GetString() : null,
+                            Url = el.TryGetProperty("url", out var url) ? url.GetString() : null,
+                            ContentType = el.TryGetProperty("contentType", out var ct) ? ct.GetString() : null,
+                            FileSize = el.TryGetProperty("fileSize", out var fs) && fs.TryGetInt64(out var l) ? l : null,
+                            Caption = el.TryGetProperty("caption", out var cap) ? cap.GetString() : null,
+                            Keywords = el.TryGetProperty("keywords", out var kw) && kw.ValueKind == JsonValueKind.Array ? kw.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrWhiteSpace(x)).Cast<string>().ToArray() : null,
+                            OcrPreview = el.TryGetProperty("ocrPreview", out var op) ? op.GetString() : null,
+                            ParentId = el.TryGetProperty("parentId", out var pid) ? pid.GetString() : null,
+                            ParentUrl = el.TryGetProperty("parentUrl", out var purl) ? purl.GetString() : null
+                        };
+                        if (!string.IsNullOrWhiteSpace(info.Url)) list.Add(info);
+                    }
+                    imagesDetailed = list.Count > 0 ? list.ToArray() : null;
+                }
+            }
+            catch { }
+        }
         
         return new SearchResult
         {
@@ -598,7 +689,11 @@ public class AzureSearchService : ISearchService
                     Language = document.GetString("language"),
                     KeyPhrases = document.TryGetValue("keyPhrases", out var keyPhrasesObj) && keyPhrasesObj is IEnumerable<object> keyPhrases
                         ? keyPhrases.Select(x => x?.ToString()).Where(x => !string.IsNullOrEmpty(x)).Cast<string>().ToArray()
-                        : null
+                        : null,
+                    HasImages = document.TryGetValue("hasImages", out var hasImagesObj) ? hasImagesObj as bool? : null,
+                    ImageCount = document.TryGetValue("imageCount", out var imageCountObj) ? imageCountObj as int? : null,
+                    Images = images,
+                    ImagesDetailed = imagesDetailed
                 }
             }
         };

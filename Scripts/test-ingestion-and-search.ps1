@@ -2,8 +2,12 @@ param(
   [string]$FunctionsBaseUrl = "http://localhost:7071",
   [string]$Container = "docs",
   [string]$LocalFilePath = "$PSScriptRoot/sample.txt",
-  [string]$UrlToIngest = "https://learn.microsoft.com/en-us/copilot/security/prompting-tips"
+  [string]$UrlToIngest = "https://learn.microsoft.com/en-us/copilot/security/prompting-tips",
+  [switch]$ShowImages
 )
+
+# Default ShowImages to true when not explicitly provided
+if(-not $PSBoundParameters.ContainsKey('ShowImages')){ $ShowImages = $true }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -64,12 +68,31 @@ $devConn = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKe
 $connString = $devConn
 if(Test-AzCli){
   Write-Info "Ensuring container '$Container' exists (az CLI)"
-  az storage container create --name $Container --connection-string $connString | Out-Null
+  try {
+    az storage container create --name $Container --connection-string $connString | Out-Null
+  } catch {
+    Write-Warn "az container create failed. Will fallback to UploadBlob function for upload."
+  }
 
   $blobName = [IO.Path]::GetFileName($LocalFilePath)
   Write-Info "Uploading $blobName to container '$Container' via az CLI"
-  az storage blob upload --file $LocalFilePath --container-name $Container --name $blobName --overwrite --connection-string $connString | Out-Null
-  Write-Ok "Upload completed"
+  $azUploaded = $false
+  try {
+    az storage blob upload --file $LocalFilePath --container-name $Container --name $blobName --overwrite --connection-string $connString | Out-Null
+    $azUploaded = $true
+  } catch {
+    Write-Warn "az blob upload failed. Falling back to UploadBlob function."
+  }
+
+  if (-not $azUploaded) {
+    $bytes = [IO.File]::ReadAllBytes($LocalFilePath)
+    $b64 = [Convert]::ToBase64String($bytes)
+    $upBody = @{ container = $Container; name = $blobName; contentBase64 = $b64; contentType = "text/plain" } | ConvertTo-Json
+    $upResp = Invoke-RestMethod -Uri "$FunctionsBaseUrl/api/UploadBlob" -Method POST -Body $upBody -ContentType "application/json"
+    Write-Ok "Upload via function completed: $($upResp.url)"
+  } else {
+    Write-Ok "Upload completed"
+  }
 } else {
   Write-Warn "az CLI not found. Skipping upload step. Place your file in the container manually or install Azure CLI."
 }
@@ -103,8 +126,45 @@ function Show-TopResults($results, $take = 3){
   $i = 0
   foreach($r in $results.results){
     $i++; if($i -gt $take){ break }
-    Write-Host ("[{0}] {1}  score={2:n3}" -f $i, ($r.content.metadata.title ?? $r.summary ?? $r.url), $r.score)
+  $title = $r.content.metadata.title
+  if([string]::IsNullOrWhiteSpace($title)){ $title = $r.summary }
+  if([string]::IsNullOrWhiteSpace($title)){ $title = $r.url }
+  $imgFlag = if($r.content.metadata.hasImages){ " hasImages=$($r.content.metadata.hasImages) imageCount=$($r.content.metadata.imageCount)" } else { "" }
+  Write-Host ("[{0}] {1}  score={2:n3}{3}" -f $i, $title, $r.score, $imgFlag)
   }
+}
+
+function Show-Images($label, $results, $take = 1){
+  if(-not $results){ return }
+  Write-Info "Images for: $label"
+  $i = 0
+  $printed = $false
+  foreach($r in $results.results){
+    $i++; if($i -gt $take){ break }
+    $meta = $r.content.metadata
+    if($meta.hasImages){
+      $printed = $true
+      Write-Host ("  [{0}] hasImages={1} imageCount={2}" -f $i, $meta.hasImages, $meta.imageCount)
+      if($meta.images){
+        Write-Host "    images:"; $meta.images | ForEach-Object { Write-Host "      - $_" }
+      }
+      if($meta.imagesDetailed){
+        Write-Host "    imagesDetailed:"
+        foreach($img in $meta.imagesDetailed){
+          $ct = if($img.contentType){$img.contentType}else{""}
+          $sz = if($img.fileSize){$img.fileSize}else{""}
+          $cap = if($img.caption){$img.caption}else{""}
+          $kws = if($img.keywords){ ($img.keywords -join ', ') } else {""}
+          Write-Host "      - url=$($img.url) contentType=$ct fileSize=$sz"
+          if($cap -or $kws){
+            if($cap){ Write-Host "          caption: $cap" }
+            if($kws){ Write-Host "          keywords: $kws" }
+          }
+        }
+      }
+    }
+  }
+  if(-not $printed){ Write-Host "  (no image details in top $take results)" }
 }
 
 Write-Info "Search: keyword on 'Azure Functions'"
@@ -114,10 +174,12 @@ Write-Host "Found: $($s1.totalResults)"; Show-TopResults $s1 5
 Write-Info "Search: keyword on 'Security Copilot' (from URL)"
 $s2 = Invoke-RestMethod -Uri "$FunctionsBaseUrl/api/Search?q=Security+Copilot&type=keyword&maxResults=5" -Method GET
 Write-Host "Found: $($s2.totalResults)"; Show-TopResults $s2 5
+if($ShowImages){ Show-Images "Security Copilot" $s2 5 }
 
 Write-Info "Search: vector on 'prompting tips'"
 $s3Body = @{ query = "prompting tips"; searchType = "Vector"; maxResults = 5 } | ConvertTo-Json
 $s3 = Invoke-RestMethod -Uri "$FunctionsBaseUrl/api/Search" -Method POST -Body $s3Body -ContentType "application/json"
 Write-Host "Found: $($s3.totalResults)"; Show-TopResults $s3 5
+if($ShowImages){ Show-Images "prompting tips" $s3 5 }
 
 Write-Ok "Test run complete."

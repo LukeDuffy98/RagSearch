@@ -200,9 +200,11 @@ curl http://localhost:7071/api/SearchStatus
 The core RAG search system is **complete and production-ready**. Future enhancements could include:
 
 ### Phase 3A: Advanced Document Processing (Optional)
-- [ ] PDF/Word/PowerPoint file processing
-- [ ] Image extraction and OCR capabilities  
-- [ ] Batch document ingestion from blob storage
+- [x] PDF/Word/PowerPoint file processing (via Azure Document Intelligence prebuilt-read)
+- [x] Image extraction and OCR capabilities  
+- [x] Batch document ingestion from blob storage
+
+See `docs/phase-3a.md` for usage and API details.
 
 ### Phase 3B: Enterprise Features (Optional)
 - [ ] Advanced filtering and faceting

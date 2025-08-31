@@ -319,7 +319,7 @@ public class SimplifiedSearchService : ISearchService
         try
         {
             if (string.IsNullOrWhiteSpace(text))
-                return new float[1536]; // Return empty embedding with expected dimensions
+                return null; // No embedding for empty text to avoid zero vectors
 
             // Truncate text if too long (OpenAI has token limits)
             var truncatedText = text.Length > 8000 ? text[..8000] : text;
@@ -357,7 +357,7 @@ public class SimplifiedSearchService : ISearchService
             .Select(item => ConvertToSearchResult(item.Document, item.Score))
             .ToList();
 
-        return Task.FromResult(ApplyFilters(results, request.Filters));
+    return Task.FromResult(ApplyFilters(results, request));
     }
 
     /// <summary>
@@ -386,7 +386,7 @@ public class SimplifiedSearchService : ISearchService
             .Select(item => ConvertToSearchResult(item.Document, item.Score))
             .ToList();
 
-        return ApplyFilters(results, request.Filters);
+    return ApplyFilters(results, request);
     }
 
     /// <summary>
@@ -428,9 +428,10 @@ public class SimplifiedSearchService : ISearchService
             }
         }
 
-        return combinedResults.Values
+        var combined = combinedResults.Values
             .OrderByDescending(r => r.Score)
             .ToList();
+        return ApplyFilters(combined, request);
     }
 
     /// <summary>
@@ -438,25 +439,60 @@ public class SimplifiedSearchService : ISearchService
     /// </summary>
     private static double CalculateKeywordScore(SearchDocument document, string[] queryWords)
     {
-        var content = document.Content?.ToLowerInvariant() ?? "";
-        var title = document.Title?.ToLowerInvariant() ?? "";
+        var content = document.Content?.ToLowerInvariant() ?? string.Empty;
+        var title = document.Title?.ToLowerInvariant() ?? string.Empty;
+        var summary = document.Summary?.ToLowerInvariant() ?? string.Empty;
+        var imageCaption = document.ImageCaption?.ToLowerInvariant() ?? string.Empty;
+        var imageKeywordsText = document.ImageKeywords != null
+            ? string.Join(' ', document.ImageKeywords).ToLowerInvariant()
+            : string.Empty;
+        var url = document.Url?.ToLowerInvariant() ?? string.Empty;
 
         double score = 0;
+
+        // Precompute exact phrase
+        var phrase = string.Join(" ", queryWords);
 
         foreach (var word in queryWords)
         {
             // Title matches get higher score
-            if (title.Contains(word))
+            if (!string.IsNullOrEmpty(title) && title.Contains(word))
                 score += 2.0;
 
-            // Content matches
-            var contentMatches = CountOccurrences(content, word);
-            score += contentMatches * 0.5;
+            // Summary matches (often holds image caption for image docs)
+            if (!string.IsNullOrEmpty(summary) && summary.Contains(word))
+                score += 1.5;
 
-            // Exact phrase bonus
-            if (content.Contains(string.Join(" ", queryWords)))
-                score += 1.0;
+            // Image caption matches (first-class field on image docs)
+            if (!string.IsNullOrEmpty(imageCaption) && imageCaption.Contains(word))
+                score += 2.0;
+
+            // Image keywords matches
+            if (!string.IsNullOrEmpty(imageKeywordsText))
+            {
+                var kwMatches = CountOccurrences(imageKeywordsText, word);
+                score += kwMatches * 1.0;
+            }
+
+            // Content matches
+            if (!string.IsNullOrEmpty(content))
+            {
+                var contentMatches = CountOccurrences(content, word);
+                score += contentMatches * 0.5;
+            }
+
+            // Tiny weight for URL occurrence, if any
+            if (!string.IsNullOrEmpty(url) && url.Contains(word))
+                score += 0.1;
         }
+
+        // Exact phrase bonuses across key fields
+        if (!string.IsNullOrEmpty(content) && content.Contains(phrase))
+            score += 1.0;
+        if (!string.IsNullOrEmpty(summary) && summary.Contains(phrase))
+            score += 1.0;
+        if (!string.IsNullOrEmpty(imageCaption) && imageCaption.Contains(phrase))
+            score += 1.5; // stronger boost for caption phrase
 
         return score;
     }
@@ -479,8 +515,19 @@ public class SimplifiedSearchService : ISearchService
             norm1 += vector1[i] * vector1[i];
             norm2 += vector2[i] * vector2[i];
         }
+        // Guard against zero-norm vectors to avoid NaN/Infinity
+        if (norm1 == 0.0 || norm2 == 0.0)
+            return 0.0;
 
-        return dotProduct / (Math.Sqrt(norm1) * Math.Sqrt(norm2));
+        var denom = Math.Sqrt(norm1) * Math.Sqrt(norm2);
+        if (denom == 0.0)
+            return 0.0;
+
+        var cosine = dotProduct / denom;
+        // Ensure finite value for JSON serialization safety
+        if (double.IsNaN(cosine) || double.IsInfinity(cosine))
+            return 0.0;
+        return cosine;
     }
 
     /// <summary>
@@ -590,9 +637,10 @@ public class SimplifiedSearchService : ISearchService
     /// <summary>
     /// Applies filters to search results
     /// </summary>
-    private static List<SearchResult> ApplyFilters(List<SearchResult> results, SearchFilters? filters)
+    private List<SearchResult> ApplyFilters(List<SearchResult> results, SearchRequest request)
     {
-        if (filters == null)
+        var filters = request.Filters;
+        if (filters == null && (request.ContentTypes == null || request.ContentTypes.Length == 0))
             return results;
 
         return results.Where(result =>
@@ -600,13 +648,33 @@ public class SimplifiedSearchService : ISearchService
             var metadata = result.Content?.Metadata;
             if (metadata == null) return true;
 
+            // Content type gating from request.ContentTypes
+            if (request.ContentTypes != null && request.ContentTypes.Length > 0)
+            {
+                var ct = metadata.ContentType ?? string.Empty;
+                // Consider both explicit category values ("image"/"text") and MIME-like values ("image/png", "text/html")
+                var isImage = ct.Equals("image", StringComparison.OrdinalIgnoreCase) || ct.StartsWith("image/", StringComparison.OrdinalIgnoreCase);
+                var isText = ct.Equals("text", StringComparison.OrdinalIgnoreCase) || ct.StartsWith("text/", StringComparison.OrdinalIgnoreCase) || !isImage; // default non-image to text bucket
+
+                var allowImage = request.ContentTypes.Any(t => string.Equals(t, "image", StringComparison.OrdinalIgnoreCase));
+                var allowText = request.ContentTypes.Any(t => string.Equals(t, "text", StringComparison.OrdinalIgnoreCase));
+                // If neither matches, allow specific contentType literal
+                var allowSpecific = request.ContentTypes.Any(t =>
+                    !string.Equals(t, "image", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(t, "text", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(ct, t, StringComparison.OrdinalIgnoreCase));
+
+                if (!(allowSpecific || (isImage && allowImage) || (isText && allowText)))
+                    return false;
+            }
+
             // File type filter
-            if (!string.IsNullOrEmpty(filters.FileType) && 
+            if (!string.IsNullOrEmpty(filters?.FileType) && 
                 !string.Equals(metadata.ContentType, filters.FileType, StringComparison.OrdinalIgnoreCase))
                 return false;
 
             // Date range filter
-            if (filters.DateRange != null)
+            if (filters?.DateRange != null)
             {
                 if (filters.DateRange.From.HasValue && metadata.Created < filters.DateRange.From.Value)
                     return false;
@@ -615,12 +683,51 @@ public class SimplifiedSearchService : ISearchService
             }
 
             // File size filter
-            if (filters.FileSize != null)
+            if (filters?.FileSize != null)
             {
                 if (filters.FileSize.Min.HasValue && metadata.FileSize < filters.FileSize.Min.Value)
                     return false;
                 if (filters.FileSize.Max.HasValue && metadata.FileSize > filters.FileSize.Max.Value)
                     return false;
+            }
+
+            // Image-focused filters
+            if (filters?.HasImages == true && metadata.HasImages != true)
+                return false;
+
+            if (!string.IsNullOrWhiteSpace(filters?.ImageCaptionContains))
+            {
+                var needle = filters!.ImageCaptionContains!.Trim();
+                bool match = false;
+                // If the document is an image child, check its own caption via detailed images or title/summary
+                if (string.Equals(metadata.ContentType, "image", StringComparison.OrdinalIgnoreCase) || (metadata.ContentType?.StartsWith("image/", StringComparison.OrdinalIgnoreCase) == true))
+                {
+                    var captionFromMeta = metadata.ImagesDetailed?.FirstOrDefault()?.Caption ?? result.Summary ?? metadata.Title ?? string.Empty;
+                    match = captionFromMeta?.Contains(needle, StringComparison.OrdinalIgnoreCase) == true;
+                }
+                else
+                {
+                    // For non-image docs, check any child image caption in imagesDetailed
+                    match = metadata.ImagesDetailed?.Any(i => (i.Caption ?? string.Empty).Contains(needle, StringComparison.OrdinalIgnoreCase)) == true;
+                }
+                if (!match) return false;
+            }
+
+            if (filters?.ImageKeywordsAny != null && filters.ImageKeywordsAny.Length > 0)
+            {
+                var want = new HashSet<string>(filters.ImageKeywordsAny.Select(k => k.Trim()), StringComparer.OrdinalIgnoreCase);
+                bool match = false;
+                if (metadata.ImagesDetailed != null)
+                {
+                    foreach (var img in metadata.ImagesDetailed)
+                    {
+                        if (img.Keywords != null && img.Keywords.Any(k => want.Contains(k)))
+                        {
+                            match = true; break;
+                        }
+                    }
+                }
+                if (!match) return false;
             }
 
             return true;
@@ -652,7 +759,11 @@ public class SimplifiedSearchService : ISearchService
                     SourceContainer = document.SourceContainer,
                     SourceType = document.SourceType,
                     Language = document.Language,
-                    KeyPhrases = document.KeyPhrases
+                    KeyPhrases = document.KeyPhrases,
+                    HasImages = document.HasImages,
+                    ImageCount = document.ImageCount,
+                    Images = ExtractImagesFromMetadata(document.Metadata),
+                    ImagesDetailed = ExtractImagesDetailedFromMetadata(document.Metadata)
                 }
             }
         };
@@ -691,6 +802,59 @@ public class SimplifiedSearchService : ISearchService
         {
             return 0;
         }
+    }
+
+    private static string[]? ExtractImagesFromMetadata(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(metadataJson);
+            if (doc.RootElement.TryGetProperty("images", out var imagesProp) && imagesProp.ValueKind == JsonValueKind.Array)
+            {
+                var items = new List<string>();
+                foreach (var el in imagesProp.EnumerateArray())
+                {
+                    var v = el.GetString();
+                    if (!string.IsNullOrWhiteSpace(v)) items.Add(v);
+                }
+                return items.Count > 0 ? items.ToArray() : null;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static ImageInfo[]? ExtractImagesDetailedFromMetadata(string? metadataJson)
+    {
+        if (string.IsNullOrWhiteSpace(metadataJson)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(metadataJson);
+            if (doc.RootElement.TryGetProperty("imagesDetailed", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                var list = new List<ImageInfo>();
+                foreach (var el in arr.EnumerateArray())
+                {
+                    var info = new ImageInfo
+                    {
+                        Id = el.TryGetProperty("id", out var id) ? id.GetString() : null,
+                        Url = el.TryGetProperty("url", out var url) ? url.GetString() : null,
+                        ContentType = el.TryGetProperty("contentType", out var ct) ? ct.GetString() : null,
+                        FileSize = el.TryGetProperty("fileSize", out var fs) && fs.TryGetInt64(out var l) ? l : null,
+                        Caption = el.TryGetProperty("caption", out var cap) ? cap.GetString() : null,
+                        Keywords = el.TryGetProperty("keywords", out var kw) && kw.ValueKind == JsonValueKind.Array ? kw.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrWhiteSpace(x)).Cast<string>().ToArray() : null,
+                        OcrPreview = el.TryGetProperty("ocrPreview", out var op) ? op.GetString() : null,
+                        ParentId = el.TryGetProperty("parentId", out var pid) ? pid.GetString() : null,
+                        ParentUrl = el.TryGetProperty("parentUrl", out var purl) ? purl.GetString() : null
+                    };
+                    if (!string.IsNullOrWhiteSpace(info.Url)) list.Add(info);
+                }
+                return list.Count > 0 ? list.ToArray() : null;
+            }
+        }
+        catch { }
+        return null;
     }
 
     #endregion

@@ -42,6 +42,18 @@ public class SearchFilters
 
     [JsonPropertyName("fileSize")]
     public FileSizeRange? FileSize { get; set; }
+
+    // Image-focused filters
+    [JsonPropertyName("hasImages")]
+    public bool? HasImages { get; set; }
+
+    // Matches image child docs where caption contains this text (case-insensitive)
+    [JsonPropertyName("imageCaptionContains")]
+    public string? ImageCaptionContains { get; set; }
+
+    // Matches image child docs where any keyword matches any of these values
+    [JsonPropertyName("imageKeywordsAny")]
+    public string[]? ImageKeywordsAny { get; set; }
 }
 
 /// <summary>
@@ -167,4 +179,54 @@ public class SearchResultMetadata
 
     [JsonPropertyName("keyPhrases")]
     public string[]? KeyPhrases { get; set; }
+
+    [JsonPropertyName("hasImages")]
+    public bool? HasImages { get; set; }
+
+    [JsonPropertyName("imageCount")]
+    public int? ImageCount { get; set; }
+
+    [JsonPropertyName("images")]
+    public string[]? Images { get; set; }
+
+    // Rich image metadata for RAG use-cases
+    [JsonPropertyName("imagesDetailed")]
+    public ImageInfo[]? ImagesDetailed { get; set; }
+}
+
+/// <summary>
+/// Detailed metadata for an image associated with a search result
+/// </summary>
+public class ImageInfo
+{
+    [JsonPropertyName("id")]
+    public string? Id { get; set; }
+
+    [JsonPropertyName("url")]
+    public string? Url { get; set; }
+
+    [JsonPropertyName("contentType")]
+    public string? ContentType { get; set; }
+
+    [JsonPropertyName("fileSize")]
+    public long? FileSize { get; set; }
+
+    // A short human-friendly caption for the image
+    [JsonPropertyName("caption")]
+    public string? Caption { get; set; }
+
+    // Lightweight keywords/tags inferred for the image
+    [JsonPropertyName("keywords")]
+    public string[]? Keywords { get; set; }
+
+    // Short preview of OCR text to help prompts decide relevance
+    [JsonPropertyName("ocrPreview")]
+    public string? OcrPreview { get; set; }
+
+    // Optional linkage back to the parent page/document
+    [JsonPropertyName("parentId")]
+    public string? ParentId { get; set; }
+
+    [JsonPropertyName("parentUrl")]
+    public string? ParentUrl { get; set; }
 }

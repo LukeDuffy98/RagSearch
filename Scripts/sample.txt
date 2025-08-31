@@ -1,0 +1,2 @@
+This is a sample document about Azure Functions and semantic search.
+It demonstrates ingestion of a plain text file and subsequent search.
