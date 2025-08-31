@@ -24,6 +24,8 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Storage.Blobs" Version="6.2.0" />
   <!-- HTML parsing for URL ingestion -->
   <PackageReference Include="HtmlAgilityPack" Version="1.11.62" />
+  <PackageReference Include="SkiaSharp" Version="2.88.8" />
+  <PackageReference Include="Svg.Skia" Version="0.5.4" />
   </ItemGroup>
   <ItemGroup>
     <None Update="host.json">

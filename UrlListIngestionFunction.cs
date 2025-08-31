@@ -13,6 +13,8 @@ using Microsoft.Extensions.Logging;
 using RagSearch.Models;
 using RagSearch.Services;
 using System.Linq;
+using SkiaSharp;
+using Svg.Skia;
 
 namespace RagSearch.Functions;
 
@@ -140,25 +142,90 @@ public class UrlListIngestionFunction
                     {
                         var minImageBytes = GetMinImageBytes();
                         var imageCandidates = ExtractImageCandidates(html, url).Take(Math.Max(0, options.MaxImagesPerPage)).ToArray();
-                        foreach (var cand in imageCandidates)
+            foreach (var cand in imageCandidates)
                         {
                             try
                             {
                                 var imgUrl = cand.Url;
                                 var imgBytes = await FetchAsync(imgUrl);
-                                // Skip if failed or too tiny (likely icons/trackers)
-                                if (imgBytes == null || imgBytes.Length == 0 || imgBytes.Length < minImageBytes) continue;
+                // Skip if failed download
+                if (imgBytes == null || imgBytes.Length == 0) continue;
 
                                 var (imgType, imgExt) = SniffImageType(imgBytes, imgUrl);
+                // Apply min-size threshold only to raster images; allow SVG regardless of bytes
+                if (!string.Equals(imgExt, "svg", StringComparison.OrdinalIgnoreCase) && imgBytes.Length < minImageBytes) continue;
                                 var caption = cand.Caption ?? cand.Alt ?? InferCaptionFromUrl(imgUrl);
                                 var urlKeywords = InferKeywordsFromUrl(imgUrl) ?? Array.Empty<string>();
+                                string? rasterizedPngUrl = null;
 
                                 // Optional OCR for image content
                                 string ocrText = string.Empty;
                                 string ocrSummary = string.Empty;
                                 string? ocrLanguage = null;
                                 string[] ocrKeyPhrases = Array.Empty<string>();
-                                if (options.OcrImages && IsOcrSupportedImage(imgType, imgExt))
+                                if (string.Equals(imgExt, "svg", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    // Extract textual content from SVG (title/desc/text) instead of OCR
+                                    try
+                                    {
+                                        ocrText = ExtractTextFromSvg(imgBytes);
+                                        if (!string.IsNullOrWhiteSpace(ocrText))
+                                        {
+                                            ocrSummary = ocrText.Length > 240 ? ocrText.Substring(0, 240) + "…" : ocrText;
+                                            ocrKeyPhrases = ExtractKeyPhrasesFromText(ocrText, 10);
+                                        }
+                                        // Rasterize to PNG so we can (optionally) OCR and/or persist a preview
+                                        var pngBytes = RasterizeSvgToPng(imgBytes);
+                                        if (pngBytes != null)
+                                        {
+                                            // Persist rasterized PNG to local blob storage for reference
+                                            try
+                                            {
+                                                var assets = _blobServiceClient.GetBlobContainerClient("search-assets");
+                                                await assets.CreateIfNotExistsAsync();
+                                                var name = $"svg/{NormalizeId(imgUrl)}.png";
+                                                var blob = assets.GetBlobClient(name);
+                                                await blob.UploadAsync(new BinaryData(pngBytes), overwrite: true);
+                                                // Run OCR on rasterized PNG if enabled
+                                                if (options.OcrImages)
+                                                {
+                                                    var pngDocToIndex = new DocumentToIndex
+                                                    {
+                                                        Id = $"ocr:{NormalizeId(imgUrl)}:png",
+                                                        SourceUrl = blob.Uri.ToString(),
+                                                        SourceType = "url",
+                                                        ContentType = "image/png",
+                                                        FileType = "png",
+                                                        Content = pngBytes,
+                                                        FileSize = pngBytes.LongLength,
+                                                        Created = DateTime.UtcNow,
+                                                        Modified = DateTime.UtcNow
+                                                    };
+                                                    var processedPng = await _docProcessor.ProcessAsync(pngDocToIndex);
+                                                    var pngOcrText = processedPng.ExtractedText ?? string.Empty;
+                                                    if (!string.IsNullOrWhiteSpace(pngOcrText) && pngOcrText.Length > (ocrText?.Length ?? 0))
+                                                    {
+                                                        ocrText = pngOcrText;
+                                                        ocrSummary = processedPng.Summary ?? (pngOcrText.Length > 240 ? pngOcrText.Substring(0, 240) + "…" : pngOcrText);
+                                                        ocrLanguage = processedPng.Language;
+                                                        ocrKeyPhrases = ExtractKeyPhrasesFromText(pngOcrText, 10);
+                                                    }
+                                                }
+                                                // Stash rasterized URL in later metadata via closure variable
+                                                rasterizedPngUrl = blob.Uri.ToString();
+                                            }
+                                            catch (Exception exUpload)
+                                            {
+                                                _logger.LogWarning(exUpload, "Failed to persist/ocr rasterized SVG PNG for {ImageUrl}", imgUrl);
+                                            }
+                                        }
+                                    }
+                                    catch (Exception exSvg)
+                                    {
+                                        _logger.LogWarning(exSvg, "Failed to parse SVG text for {ImageUrl}", imgUrl);
+                                    }
+                                }
+                                else if (options.OcrImages && IsOcrSupportedImage(imgType, imgExt))
                                 {
                                     try
                                     {
@@ -217,11 +284,108 @@ public class UrlListIngestionFunction
                                     // Also populate generic key phrases so they appear in result metadata
                                     KeyPhrases = mergedKeywords,
                                     Language = ocrLanguage,
-                                    Metadata = JsonSerializer.Serialize(new { originPage = url, contentType = imgType, caption, alt = cand.Alt, fromOg = cand.FromOg, keywords = mergedKeywords, ocr = options.OcrImages, ocrChars = ocrText?.Length ?? 0, language = ocrLanguage })
+                                    Metadata = JsonSerializer.Serialize(new { originPage = url, contentType = imgType, caption, alt = cand.Alt, fromOg = cand.FromOg, keywords = mergedKeywords, ocr = options.OcrImages, ocrChars = ocrText?.Length ?? 0, language = ocrLanguage, svg = string.Equals(imgExt, "svg", StringComparison.OrdinalIgnoreCase), rasterPng = rasterizedPngUrl })
                                 };
 
                                 toIndex.Add(imgDoc);
                                 imagesIndexed++;
+
+                                // If this was a raster under a docs media path, probe for a sibling .svg and index it too
+                                if (!string.Equals(imgExt, "svg", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    try
+                                    {
+                                        var svgUrl = TryChangeExtensionToSvg(imgUrl);
+                                        if (!string.IsNullOrEmpty(svgUrl) && !string.Equals(svgUrl, imgUrl, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            var svgBytes = await FetchAsync(svgUrl);
+                                            if (svgBytes != null && svgBytes.Length > 0)
+                                            {
+                                                var (svgCt, svgExt) = SniffImageType(svgBytes, svgUrl);
+                                                if (string.Equals(svgExt, "svg", StringComparison.OrdinalIgnoreCase))
+                                                {
+                                                    // Reuse caption/keywords; extract SVG text and rasterize as above
+                                                    string svgOcrText = ExtractTextFromSvg(svgBytes);
+                                                    string svgSummary = !string.IsNullOrWhiteSpace(svgOcrText) ? (svgOcrText.Length > 240 ? svgOcrText.Substring(0, 240) + "…" : svgOcrText) : string.Empty;
+                                                    string[] svgKp = !string.IsNullOrWhiteSpace(svgOcrText) ? ExtractKeyPhrasesFromText(svgOcrText, 10) : Array.Empty<string>();
+                                                    string? svgLang = null;
+                                                    string? svgRasterUrl = null;
+                                                    var png = RasterizeSvgToPng(svgBytes);
+                                                    if (png != null)
+                                                    {
+                                                        try
+                                                        {
+                                                            var assets = _blobServiceClient.GetBlobContainerClient("search-assets");
+                                                            await assets.CreateIfNotExistsAsync();
+                                                            var name = $"svg/{NormalizeId(svgUrl)}.png";
+                                                            var blob = assets.GetBlobClient(name);
+                                                            await blob.UploadAsync(new BinaryData(png), overwrite: true);
+                                                            svgRasterUrl = blob.Uri.ToString();
+                                                            if (options.OcrImages)
+                                                            {
+                                                                var pngDoc = new DocumentToIndex
+                                                                {
+                                                                    Id = $"ocr:{NormalizeId(svgUrl)}:png",
+                                                                    SourceUrl = svgRasterUrl,
+                                                                    SourceType = "url",
+                                                                    ContentType = "image/png",
+                                                                    FileType = "png",
+                                                                    Content = png,
+                                                                    FileSize = png.LongLength,
+                                                                    Created = DateTime.UtcNow,
+                                                                    Modified = DateTime.UtcNow
+                                                                };
+                                                                var proc = await _docProcessor.ProcessAsync(pngDoc);
+                                                                var txt = proc.ExtractedText ?? string.Empty;
+                                                                if (!string.IsNullOrWhiteSpace(txt) && txt.Length > (svgOcrText?.Length ?? 0))
+                                                                {
+                                                                    svgOcrText = txt;
+                                                                    svgSummary = proc.Summary ?? (txt.Length > 240 ? txt.Substring(0, 240) + "…" : txt);
+                                                                    svgLang = proc.Language;
+                                                                    svgKp = ExtractKeyPhrasesFromText(txt, 10);
+                                                                }
+                                                            }
+                                                        }
+                                                        catch (Exception exPng)
+                                                        {
+                                                            _logger.LogWarning(exPng, "Failed to persist/ocr sibling SVG raster for {SvgUrl}", svgUrl);
+                                                        }
+                                                    }
+
+                                                    var mergedSvgKeywords = urlKeywords.Concat(svgKp).Select(k => k.Trim().ToLowerInvariant()).Where(k => !string.IsNullOrWhiteSpace(k)).Distinct().ToArray();
+                                                    var svgDoc = new SearchDocument
+                                                    {
+                                                        Id = $"urlimg:{NormalizeId(svgUrl)}",
+                                                        Title = System.IO.Path.GetFileName(svgUrl) ?? "image",
+                                                        Content = string.Join(' ', new[] { svgSummary, caption }.Where(s => !string.IsNullOrWhiteSpace(s))),
+                                                        Summary = $"Image from {url}",
+                                                        ContentType = "image",
+                                                        FileType = svgExt,
+                                                        Created = DateTime.UtcNow,
+                                                        Modified = DateTime.UtcNow,
+                                                        Indexed = DateTime.UtcNow,
+                                                        FileSize = svgBytes.LongLength,
+                                                        Url = svgUrl,
+                                                        SourceType = "url",
+                                                        HasImages = true,
+                                                        ImageCount = 1,
+                                                        ImageCaption = caption,
+                                                        ImageKeywords = mergedSvgKeywords,
+                                                        KeyPhrases = mergedSvgKeywords,
+                                                        Language = svgLang,
+                                                        Metadata = JsonSerializer.Serialize(new { originPage = url, contentType = svgCt, caption, alt = cand.Alt, fromOg = cand.FromOg, keywords = mergedSvgKeywords, ocr = options.OcrImages, ocrChars = svgOcrText?.Length ?? 0, language = svgLang, svg = true, rasterPng = svgRasterUrl })
+                                                    };
+                                                    toIndex.Add(svgDoc);
+                                                    imagesIndexed++;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    catch (Exception exProbe)
+                                    {
+                                        _logger.LogDebug(exProbe, "No sibling SVG for {ImageUrl}", imgUrl);
+                                    }
+                                }
                             }
                             catch (Exception exImg)
                             {
@@ -453,6 +617,42 @@ public class UrlListIngestionFunction
                 if (!ShouldSkipImage(abs) && yielded.Add(abs)) yield return new ImageCandidate(abs, null, null, true);
             }
         }
+
+        // Anchors linking directly to SVGs (common in docs sites where PNG is displayed but SVG is the source)
+        var anchors = doc.DocumentNode.SelectNodes("//a[@href]") ?? Enumerable.Empty<HtmlNode>();
+        foreach (var a in anchors)
+        {
+            var href = a.GetAttributeValue("href", string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(href)) continue;
+            if (!href.Contains(".svg", StringComparison.OrdinalIgnoreCase)) continue;
+            var abs = MakeAbsoluteUrl(baseUrl, href);
+            if (ShouldSkipImage(abs)) continue;
+            var title = a.GetAttributeValue("title", string.Empty).Trim();
+            var caption = GetFigcaptionText(a);
+            if (yielded.Add(abs)) yield return new ImageCandidate(abs, string.IsNullOrWhiteSpace(title) ? null : title, caption, false);
+        }
+
+        // <object data="...svg"> and <embed src="...svg">
+        var objects = doc.DocumentNode.SelectNodes("//object[@data]") ?? Enumerable.Empty<HtmlNode>();
+        foreach (var o in objects)
+        {
+            var data = o.GetAttributeValue("data", string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(data) || !data.Contains(".svg", StringComparison.OrdinalIgnoreCase)) continue;
+            var abs = MakeAbsoluteUrl(baseUrl, data);
+            if (ShouldSkipImage(abs)) continue;
+            var caption = GetFigcaptionText(o);
+            if (yielded.Add(abs)) yield return new ImageCandidate(abs, null, caption, false);
+        }
+        var embeds = doc.DocumentNode.SelectNodes("//embed[@src]") ?? Enumerable.Empty<HtmlNode>();
+        foreach (var e in embeds)
+        {
+            var src = e.GetAttributeValue("src", string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(src) || !src.Contains(".svg", StringComparison.OrdinalIgnoreCase)) continue;
+            var abs = MakeAbsoluteUrl(baseUrl, src);
+            if (ShouldSkipImage(abs)) continue;
+            var caption = GetFigcaptionText(e);
+            if (yielded.Add(abs)) yield return new ImageCandidate(abs, null, caption, false);
+        }
     }
 
     private static string? GetFigcaptionText(HtmlNode node)
@@ -581,6 +781,7 @@ public class UrlListIngestionFunction
             "gif" => "image/gif",
             "avif" => "image/avif",
             "webp" => "image/webp",
+            "svg" => "image/svg+xml",
             _ => "application/octet-stream"
         };
         return (ct, string.IsNullOrWhiteSpace(ext) ? ct.Replace("image/","") : ext);
@@ -599,6 +800,98 @@ public class UrlListIngestionFunction
             return false; // skip gif/webp/avif
         }
         return false;
+    }
+
+    private static string ExtractTextFromSvg(byte[] bytes)
+    {
+        try
+        {
+            var xml = Encoding.UTF8.GetString(bytes);
+            // Basic fast-path: pull out contents of <title>, <desc>, and text nodes
+            // Use HtmlAgilityPack for robustness
+            var doc = new HtmlDocument();
+            doc.LoadHtml(xml);
+            var sb = new StringBuilder();
+            var title = doc.DocumentNode.SelectSingleNode("//title")?.InnerText;
+            var desc = doc.DocumentNode.SelectSingleNode("//desc")?.InnerText;
+            if (!string.IsNullOrWhiteSpace(title)) sb.AppendLine(title.Trim());
+            if (!string.IsNullOrWhiteSpace(desc)) sb.AppendLine(desc.Trim());
+            foreach (var t in doc.DocumentNode.SelectNodes("//text") ?? Enumerable.Empty<HtmlNode>())
+            {
+                var s = t.InnerText;
+                if (!string.IsNullOrWhiteSpace(s)) sb.AppendLine(s.Trim());
+            }
+            var text = HtmlEntity.DeEntitize(sb.ToString());
+            text = Regex.Replace(text, "\\s+", " ").Trim();
+            return text;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static byte[]? RasterizeSvgToPng(byte[] svgBytes, int maxWidth = 1024, int maxHeight = 1024)
+    {
+        try
+        {
+            using var svg = new SKSvg();
+            using var ms = new MemoryStream(svgBytes);
+            svg.Load(ms);
+            if (svg.Picture == null) return null;
+
+            var bounds = svg.Picture.CullRect;
+            float scale = 1f;
+            if (bounds.Width > maxWidth || bounds.Height > maxHeight)
+            {
+                var sx = maxWidth / bounds.Width;
+                var sy = maxHeight / bounds.Height;
+                scale = Math.Min(sx, sy);
+            }
+            var width = (int)Math.Ceiling(bounds.Width * scale);
+            var height = (int)Math.Ceiling(bounds.Height * scale);
+            if (width <= 0 || height <= 0) return null;
+
+            using var bitmap = new SKBitmap(width, height, true);
+            using var canvas = new SKCanvas(bitmap);
+            canvas.Clear(SKColors.Transparent);
+            canvas.Scale(scale);
+            canvas.DrawPicture(svg.Picture);
+            canvas.Flush();
+            using var image = SKImage.FromBitmap(bitmap);
+            using var pngData = image.Encode(SKEncodedImageFormat.Png, 90);
+            return pngData.ToArray();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? TryChangeExtensionToSvg(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+        if (url.EndsWith(".svg", StringComparison.OrdinalIgnoreCase)) return url;
+        try
+        {
+            var uri = new Uri(url, UriKind.Absolute);
+            var path = uri.AbsolutePath;
+            var lastSlash = path.LastIndexOf('/') + 1;
+            var file = lastSlash >= 0 ? path.Substring(lastSlash) : path;
+            var dot = file.LastIndexOf('.');
+            if (dot <= 0) return null;
+            var newFile = file.Substring(0, dot) + ".svg";
+            var newPath = lastSlash > 0 ? path.Substring(0, lastSlash) + newFile : newFile;
+            var ub = new UriBuilder(uri)
+            {
+                Path = newPath
+            };
+            return ub.Uri.ToString();
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string? InferCaptionFromUrl(string url)
