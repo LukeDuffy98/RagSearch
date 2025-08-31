@@ -52,7 +52,9 @@ public class UrlListIngestionFunction
         bool DownloadImages = true,
         bool OcrImages = true,
         int MaxUrls = 200,
-        int MaxImagesPerPage = 10);
+        int MaxImagesPerPage = 10,
+        string? AssetsListPath = null,
+        string[]? ExtraAssetUrls = null);
 
     [Function("IngestUrlList")] 
     [OpenApiOperation(operationId: "Ingest_Url_List", tags: new[] { "Ingestion" }, Summary = "Ingest URLs from a list", Description = "Reads a text file of URLs (one per line) and ingests each page's content and images.")]
@@ -69,6 +71,7 @@ public class UrlListIngestionFunction
                           ?? new IngestUrlListRequest();
 
             var urls = await ReadUrlsAsync(options);
+            var extraAssets = await ReadAssetsAsync(options);
             if (urls.Length == 0)
             {
                 resp.StatusCode = HttpStatusCode.BadRequest;
@@ -290,14 +293,14 @@ public class UrlListIngestionFunction
                                 toIndex.Add(imgDoc);
                                 imagesIndexed++;
 
-                                // If this was a raster under a docs media path, probe for a sibling .svg and index it too
+                                // If this was a raster under a docs media path, probe for a sibling .svg (try multiple variants) and index it too
                                 if (!string.Equals(imgExt, "svg", StringComparison.OrdinalIgnoreCase))
                                 {
                                     try
                                     {
-                                        var svgUrl = TryChangeExtensionToSvg(imgUrl);
-                                        if (!string.IsNullOrEmpty(svgUrl) && !string.Equals(svgUrl, imgUrl, StringComparison.OrdinalIgnoreCase))
+                                        foreach (var svgUrl in GetSvgCandidateUrls(imgUrl))
                                         {
+                                            if (string.IsNullOrEmpty(svgUrl) || string.Equals(svgUrl, imgUrl, StringComparison.OrdinalIgnoreCase)) continue;
                                             var svgBytes = await FetchAsync(svgUrl);
                                             if (svgBytes != null && svgBytes.Length > 0)
                                             {
@@ -377,6 +380,7 @@ public class UrlListIngestionFunction
                                                     };
                                                     toIndex.Add(svgDoc);
                                                     imagesIndexed++;
+                                                    break; // stop after first svg success
                                                 }
                                             }
                                         }
@@ -390,6 +394,98 @@ public class UrlListIngestionFunction
                             catch (Exception exImg)
                             {
                                 _logger.LogWarning(exImg, "Failed to ingest image: {ImageUrl}", cand.Url);
+                            }
+                        }
+                    }
+
+                    // Docs-specific heuristic: probe common media SVG locations by page slug (helps when HTML doesn't link the SVG directly)
+                    if (options.DownloadImages)
+                    {
+                        foreach (var svgUrl in DiscoverDocsSvgCandidates(url))
+                        {
+                            try
+                            {
+                                if (toIndex.Any(d => string.Equals(d.Url, svgUrl, StringComparison.OrdinalIgnoreCase))) continue;
+                                var svgBytes = await FetchAsync(svgUrl);
+                                if (svgBytes == null || svgBytes.Length == 0) continue;
+                                var (svgCt, svgExt) = SniffImageType(svgBytes, svgUrl);
+                                if (!string.Equals(svgExt, "svg", StringComparison.OrdinalIgnoreCase)) continue;
+
+                                string svgText = ExtractTextFromSvg(svgBytes);
+                                string svgSummary = !string.IsNullOrWhiteSpace(svgText) ? (svgText.Length > 240 ? svgText.Substring(0, 240) + "…" : svgText) : string.Empty;
+                                string[] svgKp = !string.IsNullOrWhiteSpace(svgText) ? ExtractKeyPhrasesFromText(svgText, 10) : Array.Empty<string>();
+                                string? svgLang = null;
+                                string? svgRasterUrl = null;
+                                var png = RasterizeSvgToPng(svgBytes);
+                                if (png != null)
+                                {
+                                    try
+                                    {
+                                        var assets = _blobServiceClient.GetBlobContainerClient("search-assets");
+                                        await assets.CreateIfNotExistsAsync();
+                                        var name = $"svg/{NormalizeId(svgUrl)}.png";
+                                        var blob = assets.GetBlobClient(name);
+                                        await blob.UploadAsync(new BinaryData(png), overwrite: true);
+                                        svgRasterUrl = blob.Uri.ToString();
+                                        if (options.OcrImages)
+                                        {
+                                            var pngDoc = new DocumentToIndex
+                                            {
+                                                Id = $"ocr:{NormalizeId(svgUrl)}:png",
+                                                SourceUrl = svgRasterUrl,
+                                                SourceType = "url",
+                                                ContentType = "image/png",
+                                                FileType = "png",
+                                                Content = png,
+                                                FileSize = png.LongLength,
+                                                Created = DateTime.UtcNow,
+                                                Modified = DateTime.UtcNow
+                                            };
+                                            var proc = await _docProcessor.ProcessAsync(pngDoc);
+                                            var txt = proc.ExtractedText ?? string.Empty;
+                                            if (!string.IsNullOrWhiteSpace(txt) && txt.Length > (svgText?.Length ?? 0))
+                                            {
+                                                svgText = txt;
+                                                svgSummary = proc.Summary ?? (txt.Length > 240 ? txt.Substring(0, 240) + "…" : txt);
+                                                svgLang = proc.Language;
+                                                svgKp = ExtractKeyPhrasesFromText(txt, 10);
+                                            }
+                                        }
+                                    }
+                                    catch (Exception exPng)
+                                    {
+                                        _logger.LogWarning(exPng, "Failed to persist/ocr docs-heuristic SVG raster for {SvgUrl}", svgUrl);
+                                    }
+                                }
+
+                                var svgDoc = new SearchDocument
+                                {
+                                    Id = $"urlimg:{NormalizeId(svgUrl)}",
+                                    Title = System.IO.Path.GetFileName(svgUrl) ?? "image",
+                                    Content = svgSummary,
+                                    Summary = $"Image from {url}",
+                                    ContentType = "image",
+                                    FileType = svgExt,
+                                    Created = DateTime.UtcNow,
+                                    Modified = DateTime.UtcNow,
+                                    Indexed = DateTime.UtcNow,
+                                    FileSize = svgBytes.LongLength,
+                                    Url = svgUrl,
+                                    SourceType = "url",
+                                    HasImages = true,
+                                    ImageCount = 1,
+                                    ImageCaption = InferCaptionFromUrl(svgUrl),
+                                    ImageKeywords = svgKp,
+                                    KeyPhrases = svgKp,
+                                    Language = svgLang,
+                                    Metadata = JsonSerializer.Serialize(new { originPage = url, contentType = svgCt, caption = InferCaptionFromUrl(svgUrl), alt = (string?)null, fromOg = false, keywords = svgKp, ocr = options.OcrImages, ocrChars = svgText?.Length ?? 0, language = svgLang, svg = true, rasterPng = svgRasterUrl })
+                                };
+                                toIndex.Add(svgDoc);
+                                imagesIndexed++;
+                            }
+                            catch (Exception exSvg)
+                            {
+                                _logger.LogDebug(exSvg, "Docs SVG heuristic failed for {SvgUrl}", svgUrl);
                             }
                         }
                     }
@@ -415,6 +511,150 @@ public class UrlListIngestionFunction
             {
                 var ids = await _searchService.IndexDocumentsAsync(toIndex.ToArray());
                 indexed += ids.Length;
+            }
+
+            // Process explicit extra asset URLs (SVGs or images) provided in the request
+            if (extraAssets.Length > 0)
+            {
+                foreach (var assetUrl in extraAssets)
+                {
+                    try
+                    {
+                        var bytes = await FetchAsync(assetUrl);
+                        if (bytes == null || bytes.Length == 0) continue;
+                        var (ct, ext) = SniffImageType(bytes, assetUrl);
+                        // Skip tiny raster images
+                        var minImageBytes = GetMinImageBytes();
+                        if (!string.Equals(ext, "svg", StringComparison.OrdinalIgnoreCase) && bytes.Length < minImageBytes) continue;
+
+                        string? ocrLanguage = null;
+                        string summary = string.Empty;
+                        string[] keyPhrases = Array.Empty<string>();
+                        string? rasterPngUrl = null;
+
+                        if (string.Equals(ext, "svg", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var svgText = ExtractTextFromSvg(bytes);
+                            if (!string.IsNullOrWhiteSpace(svgText))
+                            {
+                                summary = svgText.Length > 240 ? svgText.Substring(0, 240) + "…" : svgText;
+                                keyPhrases = ExtractKeyPhrasesFromText(svgText, 10);
+                            }
+                            var png = RasterizeSvgToPng(bytes);
+                            if (png != null)
+                            {
+                                try
+                                {
+                                    var assets = _blobServiceClient.GetBlobContainerClient("search-assets");
+                                    await assets.CreateIfNotExistsAsync();
+                                    var name = $"svg/{NormalizeId(assetUrl)}.png";
+                                    var blob = assets.GetBlobClient(name);
+                                    await blob.UploadAsync(new BinaryData(png), overwrite: true);
+                                    rasterPngUrl = blob.Uri.ToString();
+                                    if (options.OcrImages)
+                                    {
+                                        var pngDoc = new DocumentToIndex
+                                        {
+                                            Id = $"ocr:{NormalizeId(assetUrl)}:png",
+                                            SourceUrl = rasterPngUrl,
+                                            SourceType = "url",
+                                            ContentType = "image/png",
+                                            FileType = "png",
+                                            Content = png,
+                                            FileSize = png.LongLength,
+                                            Created = DateTime.UtcNow,
+                                            Modified = DateTime.UtcNow
+                                        };
+                                        var proc = await _docProcessor.ProcessAsync(pngDoc);
+                                        var txt = proc.ExtractedText ?? string.Empty;
+                                        if (!string.IsNullOrWhiteSpace(txt) && txt.Length > (summary?.Length ?? 0))
+                                        {
+                                            summary = proc.Summary ?? (txt.Length > 240 ? txt.Substring(0, 240) + "…" : txt);
+                                            ocrLanguage = proc.Language;
+                                            keyPhrases = ExtractKeyPhrasesFromText(txt, 10);
+                                        }
+                                    }
+                                }
+                                catch (Exception exPng)
+                                {
+                                    _logger.LogWarning(exPng, "Failed to persist/ocr extra asset SVG raster for {AssetUrl}", assetUrl);
+                                }
+                            }
+                        }
+                        else if (options.OcrImages && IsOcrSupportedImage(ct, ext))
+                        {
+                            try
+                            {
+                                var imgDocToIndex = new DocumentToIndex
+                                {
+                                    Id = $"ocr:{NormalizeId(assetUrl)}",
+                                    SourceUrl = assetUrl,
+                                    SourceType = "url",
+                                    ContentType = ct,
+                                    FileType = ext,
+                                    Content = bytes,
+                                    FileSize = bytes.LongLength,
+                                    Created = DateTime.UtcNow,
+                                    Modified = DateTime.UtcNow
+                                };
+                                var processedImg = await _docProcessor.ProcessAsync(imgDocToIndex);
+                                var txt = processedImg.ExtractedText ?? string.Empty;
+                                if (!string.IsNullOrWhiteSpace(txt))
+                                {
+                                    summary = processedImg.Summary ?? (txt.Length > 240 ? txt.Substring(0, 240) + "…" : txt);
+                                    ocrLanguage = processedImg.Language;
+                                    keyPhrases = ExtractKeyPhrasesFromText(txt, 10);
+                                }
+                            }
+                            catch (Exception exOcr)
+                            {
+                                _logger.LogWarning(exOcr, "OCR failed for extra asset {AssetUrl}", assetUrl);
+                            }
+                        }
+
+                        var doc = new SearchDocument
+                        {
+                            Id = $"urlimg:{NormalizeId(assetUrl)}",
+                            Title = System.IO.Path.GetFileName(assetUrl) ?? "image",
+                            Content = summary,
+                            Summary = "Standalone asset",
+                            ContentType = "image",
+                            FileType = ext,
+                            Created = DateTime.UtcNow,
+                            Modified = DateTime.UtcNow,
+                            Indexed = DateTime.UtcNow,
+                            FileSize = bytes.LongLength,
+                            Url = assetUrl,
+                            SourceType = "url",
+                            HasImages = true,
+                            ImageCount = 1,
+                            ImageCaption = InferCaptionFromUrl(assetUrl),
+                            ImageKeywords = keyPhrases,
+                            KeyPhrases = keyPhrases,
+                            Language = ocrLanguage,
+                            Metadata = JsonSerializer.Serialize(new { originPage = (string?)null, contentType = ct, caption = InferCaptionFromUrl(assetUrl), alt = (string?)null, fromOg = false, keywords = keyPhrases, ocr = options.OcrImages, language = ocrLanguage, svg = string.Equals(ext, "svg", StringComparison.OrdinalIgnoreCase), rasterPng = rasterPngUrl })
+                        };
+                        toIndex.Add(doc);
+                        imagesIndexed++;
+
+                        if (toIndex.Count >= 10)
+                        {
+                            var ids2 = await _searchService.IndexDocumentsAsync(toIndex.ToArray());
+                            indexed += ids2.Length;
+                            toIndex.Clear();
+                        }
+                    }
+                    catch (Exception exExtra)
+                    {
+                        _logger.LogWarning(exExtra, "Failed to ingest extra asset: {AssetUrl}", assetUrl);
+                    }
+                }
+                if (toIndex.Count > 0)
+                {
+                    var ids3 = await _searchService.IndexDocumentsAsync(toIndex.ToArray());
+                    indexed += ids3.Length;
+                    toIndex.Clear();
+                }
             }
 
             resp.StatusCode = HttpStatusCode.OK;
@@ -464,6 +704,28 @@ public class UrlListIngestionFunction
             _logger.LogWarning(ex, "Failed reading URL list");
         }
         return Array.Empty<string>();
+    }
+
+    private async Task<string[]> ReadAssetsAsync(IngestUrlListRequest options)
+    {
+        var urls = new List<string>();
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(options.AssetsListPath) && File.Exists(options.AssetsListPath))
+            {
+                var lines = await File.ReadAllLinesAsync(options.AssetsListPath);
+                urls.AddRange(NormalizeUrlLines(lines));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed reading Assets list");
+        }
+        if (options.ExtraAssetUrls != null && options.ExtraAssetUrls.Length > 0)
+        {
+            urls.AddRange(NormalizeUrlLines(options.ExtraAssetUrls));
+        }
+        return urls.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
     private static string[] NormalizeUrlLines(IEnumerable<string> lines)
@@ -892,6 +1154,83 @@ public class UrlListIngestionFunction
         {
             return null;
         }
+    }
+
+    private static IEnumerable<string> GetSvgCandidateUrls(string imageUrl)
+    {
+        var list = new List<string>();
+        var direct = TryChangeExtensionToSvg(imageUrl);
+        if (!string.IsNullOrEmpty(direct)) list.Add(direct);
+        try
+        {
+            var uri = new Uri(imageUrl);
+            var path = uri.AbsolutePath;
+            var dir = path.Substring(0, path.LastIndexOf('/') + 1);
+            var file = path.Substring(dir.Length);
+            var name = System.IO.Path.GetFileNameWithoutExtension(file);
+            // Common suffixes to strip for SVG originals on docs sites
+            var variants = new[] { "-share", "-social", "@2x", "-2x", "-1", "-diagram", "-en-us", "-light", "-dark" };
+            foreach (var v in variants)
+            {
+                if (name.EndsWith(v, StringComparison.OrdinalIgnoreCase))
+                {
+                    var trimmed = name.Substring(0, name.Length - v.Length);
+                    var svgPath = dir + trimmed + ".svg";
+                    var ub = new UriBuilder(uri) { Path = svgPath };
+                    list.Add(ub.Uri.ToString());
+                }
+            }
+            // Also try replacing common raster-only suffixes in middle
+            var middleReplacements = new[] { ("-en-us", ""), ("-light", ""), ("-dark", "") };
+            foreach (var (needle, repl) in middleReplacements)
+            {
+                if (name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                {
+                    var replaced = name.Replace(needle, repl, StringComparison.OrdinalIgnoreCase);
+                    var svgPath = dir + replaced + ".svg";
+                    var ub = new UriBuilder(uri) { Path = svgPath };
+                    list.Add(ub.Uri.ToString());
+                }
+            }
+        }
+        catch { }
+        return list.Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> DiscoverDocsSvgCandidates(string pageUrl)
+    {
+        // Heuristic for Microsoft Learn/docs sites where SVGs often live under /media/ or /media/diagrams/ and follow the page slug
+        var results = new List<string>();
+        try
+        {
+            var uri = new Uri(pageUrl);
+            var basePath = uri.GetLeftPart(UriPartial.Authority);
+            var segments = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length == 0) return results;
+            var slug = segments.Last();
+            // Common media folders
+            var folders = new[] { "media", "media/diagrams", "includes/media" };
+            // Candidate filenames based on slug
+            var names = new[]
+            {
+                slug + ".svg",
+                slug + "-diagram.svg",
+                slug + "-architecture.svg",
+                slug + "-shared-responsibility.svg",
+                slug.Replace('-', '_') + ".svg"
+            };
+            foreach (var folder in folders)
+            {
+                foreach (var name in names)
+                {
+                    var path = $"/{string.Join('/', segments.Take(segments.Length - 1))}/{folder}/{name}";
+                    var ub = new UriBuilder(uri) { Path = path };
+                    results.Add(ub.Uri.ToString());
+                }
+            }
+        }
+        catch { }
+        return results.Distinct(StringComparer.OrdinalIgnoreCase);
     }
 
     private static string? InferCaptionFromUrl(string url)

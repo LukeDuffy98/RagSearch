@@ -351,7 +351,11 @@ public class SimplifiedSearchService : ISearchService
         if (string.IsNullOrWhiteSpace(query))
             return Task.FromResult(new List<SearchResult>());
 
-        var queryWords = query.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        // Tokenize on non-alphanumeric to handle hyphens/underscores etc.
+        var queryWords = System.Text.RegularExpressions.Regex
+            .Split(query.ToLowerInvariant(), "[^a-z0-9]+")
+            .Where(w => !string.IsNullOrWhiteSpace(w))
+            .ToArray();
 
         // Pre-filter by content type if specified
         IEnumerable<SearchDocument> docs = _documentsCache.Values;
@@ -368,7 +372,10 @@ public class SimplifiedSearchService : ISearchService
             var content = doc.Content ?? string.Empty;
             var title = doc.Title ?? string.Empty;
             var summary = doc.Summary ?? string.Empty;
-            var allText = string.Join(" ", title, summary, content).ToLowerInvariant();
+            var caption = doc.ImageCaption ?? string.Empty;
+            var keywords = doc.ImageKeywords != null ? string.Join(' ', doc.ImageKeywords) : string.Empty;
+            var url = doc.Url ?? string.Empty;
+            var allText = string.Join(" ", title, summary, caption, keywords, content, url).ToLowerInvariant();
 
             int score = 0;
             foreach (var word in queryWords)
