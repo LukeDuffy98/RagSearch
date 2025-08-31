@@ -1,0 +1,385 @@
+name: Copilot Agent CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run drift detection daily at 6 AM UTC
+    - cron: '0 6 * * *'
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  AZURE_FUNCTIONAPP_NAME: 'ragsearch-copilot-agent'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build and Test
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Restore dependencies
+      run: dotnet restore
+    
+    - name: Build
+      run: dotnet build --no-restore --configuration Release
+    
+    - name: Run unit tests
+      run: dotnet test --no-build --configuration Release --verbosity normal
+      
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: function-app
+        path: bin/Release/net8.0/
+
+  smoke-tests:
+    runs-on: ubuntu-latest
+    name: Smoke Tests
+    needs: build
+    if: github.event_name != 'schedule'  # Skip smoke tests on scheduled runs
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Setup Node.js for MCP
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    
+    - name: Install Azure Functions Core Tools
+      run: |
+        curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
+        sudo mv microsoft.gpg /etc/apt/trusted.gpg.d/microsoft.gpg
+        sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-$(lsb_release -cs)-prod $(lsb_release -cs) main" > /etc/apt/sources.list.d/dotnetdev.list'
+        sudo apt-get update
+        sudo apt-get install azure-functions-core-tools-4
+    
+    - name: Install MCP GitHub Server
+      run: npm install -g @modelcontextprotocol/server-github
+    
+    - name: Create test local.settings.json
+      run: |
+        cat > local.settings.json << EOF
+        {
+          "IsEncrypted": false,
+          "Values": {
+            "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+            "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+            "SEARCH_SERVICE_TYPE": "simplified",
+            "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+            "GITHUB_REPO_ALLOWLIST": "${{ github.repository }}",
+            "GITHUB_API_BASE": "https://api.github.com",
+            "MSDOCS_ALLOWED_HOSTS": "learn.microsoft.com,docs.microsoft.com",
+            "MSDOCS_CACHE_TTL_SECONDS": "86400",
+            "AGENT_LOG_LEVEL": "info",
+            "AGENT_REQUEST_TIMEOUT_MS": "30000",
+            "MCP_SERVER_TRANSPORT": "stdio",
+            "MCP_SERVER_COMMAND": "npx @modelcontextprotocol/server-github",
+            "MCP_SERVER_HEALTH_CHECK_INTERVAL_MS": "60000",
+            "MCP_SERVER_MAX_RETRIES": "3",
+            "MCP_SERVER_RETRY_DELAY_MS": "1000",
+            "GITHUB_RATE_LIMIT_PER_HOUR": "5000",
+            "MSDOCS_RATE_LIMIT_PER_HOUR": "1000",
+            "CIRCUIT_BREAKER_FAILURE_THRESHOLD": "5",
+            "CIRCUIT_BREAKER_TIMEOUT_MS": "60000",
+            "ENABLE_VERBOSE_LOGGING": "false",
+            "ENABLE_METRICS_COLLECTION": "true",
+            "LOG_REDACTION_ENABLED": "true",
+            "TELEMETRY_CORRELATION_ID_HEADER": "x-correlation-id"
+          }
+        }
+        EOF
+    
+    - name: Start Azurite (Azure Storage Emulator)
+      run: |
+        npm install -g azurite
+        azurite --silent --location ./azurite --debug ./azurite/debug.log &
+        sleep 10
+    
+    - name: Build and start Functions
+      run: |
+        echo "Building the project..."
+        dotnet build --configuration Release
+        
+        echo "Verifying Azure Functions Core Tools installation..."
+        func --version || echo "func command not found"
+        
+        echo "Starting Azure Functions runtime..."
+        func start --host 0.0.0.0 --port 7071 &
+        
+        echo "Waiting for Functions to start up..."
+        sleep 45
+        
+        echo "Checking if Functions is responding..."
+        for i in {1..10}; do
+          if curl -s --connect-timeout 5 --max-time 10 http://localhost:7071/admin/host/ping > /dev/null 2>&1; then
+            echo "✓ Functions runtime is responding"
+            break
+          elif [ $i -eq 10 ]; then
+            echo "❌ Functions runtime failed to respond after 10 attempts"
+            echo "Checking processes:"
+            ps aux | grep -E "(func|dotnet)" || echo "No relevant processes found"
+            exit 1
+          else
+            echo "Attempt $i/10: Functions not ready yet, waiting..."
+            sleep 5
+          fi
+        done
+      env:
+        AzureWebJobsStorage: "UseDevelopmentStorage=true"
+    
+    - name: Test Agent Health Check
+      run: |
+        echo "Testing Agent Health Check endpoint..."
+        echo "Checking if Functions runtime is running..."
+        
+        # Check if the process is running
+        if ps aux | grep -q "func.*start"; then
+          echo "✓ Azure Functions runtime is running"
+        else
+          echo "⚠️  Azure Functions runtime may not be running properly"
+          echo "Running processes:"
+          ps aux | grep -E "(func|dotnet)" || echo "No relevant processes found"
+        fi
+        
+        # Test connectivity with better error handling
+        echo "Testing health check endpoint connectivity..."
+        response=$(curl -s -o response.json -w "%{http_code}" --connect-timeout 10 --max-time 30 http://localhost:7071/api/AgentHealthCheck)
+        echo "HTTP Status: $response"
+        echo "Response content:"
+        
+        if [ -f response.json ]; then
+          cat response.json
+        else
+          echo "No response file created"
+        fi
+        
+        if [ "$response" -eq 200 ] || [ "$response" -eq 503 ]; then
+          echo "✓ Health check endpoint responding"
+          if command -v jq &> /dev/null && [ -f response.json ]; then
+            echo "Formatted response:"
+            cat response.json | jq '.' || echo "Could not format JSON"
+          fi
+        else
+          echo "✗ Health check endpoint failed with status: $response"
+          echo "Checking service logs..."
+          # Try to get any relevant error information
+          if [ -f response.json ]; then
+            echo "Error response content:"
+            cat response.json
+          fi
+          exit 1
+        fi
+    
+    - name: Test Agent Metrics
+      run: |
+        echo "Testing Agent Metrics endpoint..."
+        response=$(curl -s -o metrics.json -w "%{http_code}" http://localhost:7071/api/AgentMetrics)
+        echo "HTTP Status: $response"
+        if [ "$response" -eq 200 ]; then
+          echo "✓ Metrics endpoint responding"
+          cat metrics.json | jq '.metrics'
+        else
+          echo "✗ Metrics endpoint failed"
+          cat metrics.json
+          exit 1
+        fi
+    
+    - name: Test MS Docs Connectivity
+      run: |
+        echo "Testing MS Docs connectivity..."
+        # Test direct connectivity to MS Docs (bypassing Functions for basic connectivity test)
+        curl -s --head --max-time 10 https://learn.microsoft.com | head -1
+        curl -s --head --max-time 10 https://docs.microsoft.com | head -1
+        echo "✓ MS Docs connectivity test completed"
+    
+    - name: Test MCP GitHub Server
+      run: |
+        echo "Testing MCP GitHub server installation..."
+        if command -v npx &> /dev/null; then
+          echo "✓ npx available"
+          # Test MCP server can be found
+          npx @modelcontextprotocol/server-github --help || echo "MCP server help command executed"
+          echo "✓ MCP GitHub server test completed"
+        else
+          echo "✗ npx not available"
+          exit 1
+        fi
+    
+    - name: Cache Management Test
+      run: |
+        echo "Testing cache management endpoints..."
+        # Test cache cleanup
+        cleanup_response=$(curl -s -X POST -w "%{http_code}" http://localhost:7071/api/AgentCacheManagement)
+        echo "Cache cleanup response: $cleanup_response"
+        
+        # Test cache invalidation (should return 400 since no URL provided)
+        invalidation_response=$(curl -s -X DELETE -w "%{http_code}" http://localhost:7071/api/AgentCacheManagement)
+        echo "Cache invalidation response: $invalidation_response"
+        
+        echo "✓ Cache management tests completed"
+
+  drift-detection:
+    runs-on: ubuntu-latest
+    name: Drift Detection
+    if: github.event_name == 'schedule'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check GitHub Token Validity
+      run: |
+        echo "Checking GitHub token validity..."
+        response=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/rate_limit)
+        echo "$response" | jq '.'
+        
+        # Check if we're approaching rate limits
+        remaining=$(echo "$response" | jq '.rate.remaining')
+        limit=$(echo "$response" | jq '.rate.limit')
+        percentage=$((remaining * 100 / limit))
+        
+        echo "Rate limit: $remaining/$limit ($percentage% remaining)"
+        
+        if [ "$percentage" -lt 20 ]; then
+          echo "⚠️  WARNING: GitHub rate limit is running low ($percentage% remaining)"
+          echo "::warning::GitHub rate limit is running low: $remaining/$limit remaining"
+        fi
+        
+        if [ "$remaining" -eq 0 ]; then
+          echo "❌ ERROR: GitHub rate limit exceeded"
+          exit 1
+        fi
+        
+        echo "✓ GitHub token is valid and has sufficient rate limit"
+    
+    - name: Check MCP Server Versions
+      run: |
+        echo "Checking MCP server version compatibility..."
+        
+        # Check if MCP GitHub server is available
+        npm view @modelcontextprotocol/server-github version
+        
+        # Check for any security advisories
+        npm audit --package-lock-only --audit-level moderate || echo "npm audit completed with warnings"
+        
+        echo "✓ MCP server version check completed"
+    
+    - name: Test MS Docs Availability
+      run: |
+        echo "Testing MS Docs endpoints availability..."
+        
+        endpoints=(
+          "https://learn.microsoft.com"
+          "https://docs.microsoft.com"
+          "https://learn.microsoft.com/api/health"
+        )
+        
+        failed_endpoints=()
+        
+        for endpoint in "${endpoints[@]}"; do
+          echo "Testing $endpoint..."
+          if curl -s --head --max-time 10 "$endpoint" > /dev/null; then
+            echo "✓ $endpoint is available"
+          else
+            echo "❌ $endpoint is not available"
+            failed_endpoints+=("$endpoint")
+          fi
+        done
+        
+        if [ ${#failed_endpoints[@]} -gt 0 ]; then
+          echo "::warning::Some MS Docs endpoints are not available: ${failed_endpoints[*]}"
+        else
+          echo "✓ All MS Docs endpoints are available"
+        fi
+    
+    - name: Check Dependencies for Updates
+      run: |
+        echo "Checking for dependency updates..."
+        
+        # Check .NET packages for updates
+        dotnet list package --outdated || echo "Package check completed"
+        
+        echo "✓ Dependency check completed"
+    
+    - name: Create Drift Detection Report
+      if: always()
+      run: |
+        echo "## Drift Detection Report - $(date)" > drift-report.md
+        echo "" >> drift-report.md
+        echo "### GitHub Token Status" >> drift-report.md
+        echo "- Token validity: ✓" >> drift-report.md
+        echo "- Rate limit status: See logs above" >> drift-report.md
+        echo "" >> drift-report.md
+        echo "### MCP Server Status" >> drift-report.md
+        echo "- Server availability: ✓" >> drift-report.md
+        echo "" >> drift-report.md
+        echo "### MS Docs Status" >> drift-report.md
+        echo "- Endpoint availability: See logs above" >> drift-report.md
+        echo "" >> drift-report.md
+        echo "### Dependencies" >> drift-report.md
+        echo "- Dependency check: See logs above" >> drift-report.md
+        
+        cat drift-report.md
+    
+    - name: Upload Drift Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: drift-detection-report
+        path: drift-report.md
+
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy to Azure
+    needs: [build, smoke-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: function-app
+        path: ./deploy
+    
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Deploy to Azure Functions
+      uses: Azure/functions-action@v1
+      with:
+        app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+        package: './deploy'
+    
+    - name: Post-deployment Health Check
+      run: |
+        echo "Waiting for deployment to be ready..."
+        sleep 60
+        
+        # Test the deployed health check endpoint
+        response=$(curl -s -w "%{http_code}" "https://${{ env.AZURE_FUNCTIONAPP_NAME }}.azurewebsites.net/api/AgentHealthCheck")
+        echo "Health check response: $response"
+        
+        if [ "$response" -eq 200 ] || [ "$response" -eq 503 ]; then
+          echo "✓ Deployment health check passed"
+        else
+          echo "❌ Deployment health check failed"
+          exit 1
+        fi

@@ -20,6 +20,34 @@
     "# Azure OpenAI Configuration": "# Required for embeddings and vector search",
     "AZURE_OPENAI_ENDPOINT": "https://your-openai-service.openai.azure.com/",
     "AZURE_OPENAI_API_KEY": "your-openai-api-key",
-    "AZURE_OPENAI_DEPLOYMENT_NAME": "text-embedding-3-small"
+    "AZURE_OPENAI_DEPLOYMENT_NAME": "text-embedding-3-small",
+    
+    "# Copilot Agent Configuration": "# GitHub MCP server and MS Docs integration",
+    "GITHUB_TOKEN": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "GITHUB_REPO_ALLOWLIST": "LukeDuffy98/RagSearch",
+    "GITHUB_API_BASE": "https://api.github.com",
+    "MSDOCS_ALLOWED_HOSTS": "learn.microsoft.com,docs.microsoft.com",
+    "MSDOCS_CACHE_TTL_SECONDS": "86400",
+    "AGENT_LOG_LEVEL": "info",
+    "AGENT_REQUEST_TIMEOUT_MS": "30000",
+    
+    "# MCP Server Configuration": "# Model Context Protocol settings",
+    "MCP_SERVER_TRANSPORT": "stdio",
+    "MCP_SERVER_COMMAND": "npx @modelcontextprotocol/server-github",
+    "MCP_SERVER_HEALTH_CHECK_INTERVAL_MS": "60000",
+    "MCP_SERVER_MAX_RETRIES": "3",
+    "MCP_SERVER_RETRY_DELAY_MS": "1000",
+    
+    "# Rate Limiting Configuration": "# External API call limits",
+    "GITHUB_RATE_LIMIT_PER_HOUR": "5000",
+    "MSDOCS_RATE_LIMIT_PER_HOUR": "1000",
+    "CIRCUIT_BREAKER_FAILURE_THRESHOLD": "5",
+    "CIRCUIT_BREAKER_TIMEOUT_MS": "60000",
+    
+    "# Observability Configuration": "# Logging and metrics",
+    "ENABLE_VERBOSE_LOGGING": "false",
+    "ENABLE_METRICS_COLLECTION": "true",
+    "LOG_REDACTION_ENABLED": "true",
+    "TELEMETRY_CORRELATION_ID_HEADER": "x-correlation-id"
   }
 }
