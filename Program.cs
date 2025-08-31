@@ -1,6 +1,7 @@
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Configuration;
 using Azure.Search.Documents;
 using Azure.Search.Documents.Indexes;
 using Azure;
@@ -14,6 +15,47 @@ var host = new HostBuilder()
     {
         services.AddApplicationInsightsTelemetryWorkerService();
         services.ConfigureFunctionsApplicationInsights();
+        
+        // Register configurations
+        services.AddSingleton(provider =>
+        {
+            var configuration = provider.GetRequiredService<IConfiguration>();
+            return McpServerConfiguration.FromConfiguration(configuration);
+        });
+        
+        services.AddSingleton(provider =>
+        {
+            var configuration = provider.GetRequiredService<IConfiguration>();
+            return ResilienceConfiguration.FromConfiguration(configuration);
+        });
+        
+        services.AddSingleton(provider =>
+        {
+            var configuration = provider.GetRequiredService<IConfiguration>();
+            return SecureLoggingConfiguration.FromConfiguration(configuration);
+        });
+        
+        services.AddSingleton(provider =>
+        {
+            var configuration = provider.GetRequiredService<IConfiguration>();
+            return MsDocsCacheConfiguration.FromConfiguration(configuration);
+        });
+        
+        // Register Copilot Agent services
+        services.AddScoped<IMcpHealthCheckService, McpHealthCheckService>();
+        services.AddSingleton<IRateLimiter, InMemoryRateLimiter>();
+        services.AddSingleton<ICircuitBreaker, SimpleCircuitBreaker>();
+        services.AddScoped<IResilientHttpService, ResilientHttpService>();
+        services.AddScoped<ISecureLogger, SecureLogger>();
+        services.AddSingleton<IMetricsCollector, SimpleMetricsCollector>();
+        services.AddSingleton<IMsDocsCacheService, InMemoryMsDocsCacheService>();
+        
+        // Register HTTP client for MS Docs
+        services.AddHttpClient<IMsDocsHttpService, MsDocsHttpService>(client =>
+        {
+            client.DefaultRequestHeaders.Add("User-Agent", "RagSearch/1.0 (Copilot Agent Coder)");
+            client.Timeout = TimeSpan.FromSeconds(30);
+        });
         
         // Get the search service type from configuration
         var searchServiceType = Environment.GetEnvironmentVariable("SEARCH_SERVICE_TYPE") ?? "simplified";
