@@ -45,6 +45,19 @@ public class DocumentProcessingService : IDocumentProcessingService
 
         try
         {
+            // For plain text and HTML-like content, skip DI and use lightweight path
+            var ct = (document.ContentType ?? string.Empty).ToLowerInvariant();
+            var ft = (document.FileType ?? string.Empty).ToLowerInvariant();
+            bool isTextual = ct.StartsWith("text/") || ft is "txt" or "md" or "csv" or "html" or "htm";
+
+            if (isTextual)
+            {
+                processed.ExtractedText = TryDecodeText(document.Content);
+                processed.Summary = BuildSummary(processed.ExtractedText);
+                processed.ExtractedImages = Array.Empty<ExtractedImage>();
+                return processed;
+            }
+
             _logger.LogInformation("Analyzing document {Id} with prebuilt-read (size: {Size} bytes, type: {Type})", document.Id, document.Content.Length, document.ContentType);
 
             using var stream = new MemoryStream(document.Content);

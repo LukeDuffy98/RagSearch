@@ -30,8 +30,8 @@ public class SearchFunction
     [Function("SearchGet")]
     [OpenApiOperation(operationId: "Search_Run_Get", tags: new[] { "Search" }, Summary = "Search documents (GET)", Description = "Performs keyword/hybrid searches over the persistent index using query parameters.")]
     [OpenApiParameter(name: "q", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Query text", Description = "Search query text.")]
-    [OpenApiParameter(name: "type", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Search type", Description = "keyword|vector|hybrid")]
-    [OpenApiParameter(name: "content", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Content types", Description = "Comma-separated content types (e.g., text,image)")]
+    [OpenApiParameter(name: "type", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Type/mode", Description = "Search mode (keyword|vector|hybrid) OR content filter (text|image)")]
+    [OpenApiParameter(name: "content", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Content filter", Description = "Comma-separated content types (e.g., text,image). If omitted, you can also pass type=image or type=text as a shorthand.")]
     [OpenApiParameter(name: "maxResults", In = ParameterLocation.Query, Required = false, Type = typeof(int), Summary = "Max results", Description = "Maximum results to return")]
     [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "application/json", bodyType: typeof(SearchResponse), Summary = "Search results", Description = "Search results payload.")]
     [OpenApiResponseWithBody(statusCode: HttpStatusCode.BadRequest, contentType: "text/plain", bodyType: typeof(string))]
@@ -53,14 +53,38 @@ public class SearchFunction
             }
 
             var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
+
+            var qText = query["q"] ?? string.Empty;
+            var typeParam = (query["type"] ?? string.Empty).Trim();
+            var contentParam = (query["content"] ?? string.Empty).Trim();
+
+            // Determine content filter. Priority: explicit 'content' param; else allow shorthand via type=image|text; else default both.
+            string[] contentTypes;
+            if (!string.IsNullOrEmpty(contentParam))
+            {
+                contentTypes = contentParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            }
+            else if (typeParam.Equals("image", StringComparison.OrdinalIgnoreCase) || typeParam.Equals("text", StringComparison.OrdinalIgnoreCase))
+            {
+                contentTypes = new[] { typeParam.ToLowerInvariant() };
+            }
+            else
+            {
+                contentTypes = new[] { "text", "image" };
+            }
+
+            // Determine search mode. Accept keyword|vector|hybrid via 'type', otherwise default to Keyword.
+            SearchType mode = SearchType.Keyword;
+            if (Enum.TryParse<SearchType>(typeParam, true, out var parsedMode))
+            {
+                mode = parsedMode;
+            }
+
             var searchRequest = new SearchRequest
             {
-                Query = query["q"] ?? string.Empty,
-                SearchType = Enum.TryParse<SearchType>(query["type"], true, out var searchType)
-                    ? searchType : SearchType.Keyword,
-                ContentTypes = !string.IsNullOrEmpty(query["content"]) 
-                    ? query["content"]!.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                    : ["text", "image"],
+                Query = qText,
+                SearchType = mode,
+                ContentTypes = contentTypes,
                 MaxResults = int.TryParse(query["maxResults"], out var maxResults) ? maxResults : 10
             };
 

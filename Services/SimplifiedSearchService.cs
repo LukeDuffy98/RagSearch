@@ -347,17 +347,44 @@ public class SimplifiedSearchService : ISearchService
     /// </summary>
     private Task<List<SearchResult>> PerformKeywordSearchAsync(SearchRequest request)
     {
-        var query = request.Query.ToLowerInvariant();
-        var queryWords = query.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var query = request.Query;
+        if (string.IsNullOrWhiteSpace(query))
+            return Task.FromResult(new List<SearchResult>());
 
-        var results = _documentsCache.Values
-            .Select(doc => new { Document = doc, Score = CalculateKeywordScore(doc, queryWords) })
-            .Where(item => item.Score > 0)
-            .OrderByDescending(item => item.Score)
-            .Select(item => ConvertToSearchResult(item.Document, item.Score))
-            .ToList();
+        var queryWords = query.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
-    return Task.FromResult(ApplyFilters(results, request));
+        // Pre-filter by content type if specified
+        IEnumerable<SearchDocument> docs = _documentsCache.Values;
+        if (request.ContentTypes != null && request.ContentTypes.Length > 0)
+        {
+            var allowed = request.ContentTypes.Select(t => t.ToLowerInvariant()).ToHashSet();
+            docs = docs.Where(d => allowed.Contains(d.ContentType.ToLowerInvariant()) || allowed.Contains(d.FileType.ToLowerInvariant()));
+        }
+
+        var results = new List<SearchResult>(capacity: 32);
+        foreach (var doc in docs)
+        {
+            // Use cached lowercased content for scoring
+            var content = doc.Content ?? string.Empty;
+            var title = doc.Title ?? string.Empty;
+            var summary = doc.Summary ?? string.Empty;
+            var allText = string.Join(" ", title, summary, content).ToLowerInvariant();
+
+            int score = 0;
+            foreach (var word in queryWords)
+            {
+                if (string.IsNullOrWhiteSpace(word)) continue;
+                // Fast substring search
+                if (allText.Contains(word)) score++;
+            }
+            if (score > 0)
+            {
+                results.Add(ConvertToSearchResult(doc, score));
+            }
+        }
+
+        results = results.OrderByDescending(r => r.Score).ToList();
+        return Task.FromResult(ApplyFilters(results, request));
     }
 
     /// <summary>
@@ -739,6 +766,27 @@ public class SimplifiedSearchService : ISearchService
     /// </summary>
     private static SearchResult ConvertToSearchResult(SearchDocument document, double score)
     {
+        var images = ExtractImagesFromMetadata(document.Metadata);
+        var imagesDetailed = ExtractImagesDetailedFromMetadata(document.Metadata);
+
+        // Fallback: for standalone image docs, surface caption/keywords directly if metadata lacks imagesDetailed
+        if ((imagesDetailed == null || imagesDetailed.Length == 0) &&
+            string.Equals(document.ContentType, "image", StringComparison.OrdinalIgnoreCase))
+        {
+            imagesDetailed = new[]
+            {
+                new ImageInfo
+                {
+                    Id = document.Id,
+                    Url = document.Url,
+                    ContentType = !string.IsNullOrWhiteSpace(document.FileType) ? $"image/{document.FileType}" : "image",
+                    FileSize = document.FileSize,
+                    Caption = document.ImageCaption,
+                    Keywords = document.ImageKeywords
+                }
+            };
+        }
+
         return new SearchResult
         {
             Score = score,
@@ -762,8 +810,8 @@ public class SimplifiedSearchService : ISearchService
                     KeyPhrases = document.KeyPhrases,
                     HasImages = document.HasImages,
                     ImageCount = document.ImageCount,
-                    Images = ExtractImagesFromMetadata(document.Metadata),
-                    ImagesDetailed = ExtractImagesDetailedFromMetadata(document.Metadata)
+                    Images = images,
+                    ImagesDetailed = imagesDetailed
                 }
             }
         };

@@ -64,6 +64,34 @@
 			"command": "host start",
 			"isBackground": true,
 			"problemMatcher": "$func-dotnet-watch"
+		},
+		{
+			"label": "start functions host",
+			"type": "shell",
+			"command": "func",
+			"args": [
+				"start"
+			],
+			"isBackground": true,
+			"problemMatcher": [
+				"$func-watch"
+			],
+			"group": "build"
+		},
+		{
+			"label": "start functions host 7072",
+			"type": "shell",
+			"command": "func",
+			"args": [
+				"start",
+				"--port",
+				"7072"
+			],
+			"isBackground": true,
+			"problemMatcher": [
+				"$func-watch"
+			],
+			"group": "build"
 		}
 	]
 }
