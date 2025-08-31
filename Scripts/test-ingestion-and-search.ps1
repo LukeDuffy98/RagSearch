@@ -36,6 +36,14 @@ if(-not $isUp){
 Write-Ok "Functions host reachable."
 
 # 1) Prepare a local sample file
+# Expand $PSScriptRoot if it appeared literally from caller
+if ($LocalFilePath -match '\$PSScriptRoot') {
+  $LocalFilePath = $ExecutionContext.InvokeCommand.ExpandString($LocalFilePath)
+}
+# If still not rooted, make it relative to this script folder
+if (-not [IO.Path]::IsPathRooted($LocalFilePath)) {
+  if ($PSScriptRoot) { $LocalFilePath = Join-Path $PSScriptRoot $LocalFilePath }
+}
 if(-not (Test-Path -Path $LocalFilePath)){
   Write-Info "Creating sample file at $LocalFilePath"
   @"
@@ -51,7 +59,9 @@ function Test-AzCli {
   if (Get-Command az -ErrorAction SilentlyContinue) { return $true } else { return $false }
 }
 
-$connString = "UseDevelopmentStorage=true"
+# Build a connection string for Azurite if using local dev storage
+$devConn = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFe7Z+Zf2n0NRZ6IFSuFZfVZgZ6r5hAZdZ4hZ0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;QueueEndpoint=http://127.0.0.1:10001/devstoreaccount1;TableEndpoint=http://127.0.0.1:10002/devstoreaccount1"
+$connString = $devConn
 if(Test-AzCli){
   Write-Info "Ensuring container '$Container' exists (az CLI)"
   az storage container create --name $Container --connection-string $connString | Out-Null
@@ -75,7 +85,12 @@ Write-Info "Downloading URL content: $UrlToIngest"
 $urlResp = Invoke-WebRequest -UseBasicParsing -Uri $UrlToIngest -Method GET
 $urlText = $urlResp.Content
 
-$title = ($urlResp.ParsedHtml.title 2>$null)
+# Parse <title> from HTML content without relying on ParsedHtml
+$title = $null
+if ($urlText) {
+  $m = [regex]::Match($urlText, '<title>(.*?)</title>', 'IgnoreCase')
+  if ($m.Success) { $title = $m.Groups[1].Value.Trim() }
+}
 if([string]::IsNullOrWhiteSpace($title)){ $title = "URL Document" }
 
 $urlDoc = @{ Title = $title; Url = $UrlToIngest; Content = $urlText } | ConvertTo-Json -Depth 5
