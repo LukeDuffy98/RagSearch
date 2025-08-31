@@ -13,9 +13,9 @@
     "AZURE_SEARCH_API_KEY": "your-search-service-api-key",
     "AZURE_SEARCH_INDEX_NAME": "ragsearch-documents",
     
-    "# Azure AI Services Configuration": "# Required for document processing",
-    "AZURE_AI_SERVICES_ENDPOINT": "https://your-ai-services.cognitiveservices.azure.com",
-    "AZURE_AI_SERVICES_API_KEY": "your-ai-services-api-key",
+  "# Azure Document Intelligence Configuration": "# Required for OCR/text extraction",
+  "AZURE_DOCUMENTINTELLIGENCE_ENDPOINT": "https://your-cognitive-service.cognitiveservices.azure.com",
+  "AZURE_DOCUMENTINTELLIGENCE_API_KEY": "your-cognitive-key",
     
     "# Azure OpenAI Configuration": "# Required for embeddings and vector search",
     "AZURE_OPENAI_ENDPOINT": "https://your-openai-service.openai.azure.com/",

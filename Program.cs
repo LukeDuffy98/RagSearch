@@ -7,6 +7,7 @@ using Azure;
 using Azure.AI.OpenAI;
 using Azure.Storage.Blobs;
 using RagSearch.Services;
+using Azure.AI.FormRecognizer.DocumentAnalysis;
 
 var host = new HostBuilder()
     .ConfigureFunctionsWorkerDefaults()
@@ -68,6 +69,19 @@ var host = new HostBuilder()
                 var credential = new AzureKeyCredential(openAIApiKey);
                 return new OpenAIClient(new Uri(openAIEndpoint), credential);
             });
+
+            // Document Intelligence client for OCR/text extraction
+            services.AddSingleton<DocumentAnalysisClient>(provider =>
+            {
+                var diEndpoint = Environment.GetEnvironmentVariable("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT")
+                    ?? throw new InvalidOperationException("AZURE_DOCUMENTINTELLIGENCE_ENDPOINT is not configured");
+                var diKey = Environment.GetEnvironmentVariable("AZURE_DOCUMENTINTELLIGENCE_API_KEY")
+                    ?? throw new InvalidOperationException("AZURE_DOCUMENTINTELLIGENCE_API_KEY is not configured");
+                var credential = new AzureKeyCredential(diKey);
+                return new DocumentAnalysisClient(new Uri(diEndpoint), credential);
+            });
+
+            services.AddScoped<IDocumentProcessingService, DocumentProcessingService>();
             
             // Register simplified search service
             services.AddScoped<ISearchService, SimplifiedSearchService>();
