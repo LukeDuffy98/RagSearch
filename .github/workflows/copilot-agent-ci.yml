@@ -60,6 +60,14 @@ jobs:
       with:
         node-version: '18'
     
+    - name: Install Azure Functions Core Tools
+      run: |
+        curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
+        sudo mv microsoft.gpg /etc/apt/trusted.gpg.d/microsoft.gpg
+        sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-$(lsb_release -cs)-prod $(lsb_release -cs) main" > /etc/apt/sources.list.d/dotnetdev.list'
+        sudo apt-get update
+        sudo apt-get install azure-functions-core-tools-4
+    
     - name: Install MCP GitHub Server
       run: npm install -g @modelcontextprotocol/server-github
     
@@ -104,23 +112,76 @@ jobs:
     
     - name: Build and start Functions
       run: |
+        echo "Building the project..."
         dotnet build --configuration Release
+        
+        echo "Verifying Azure Functions Core Tools installation..."
+        func --version || echo "func command not found"
+        
+        echo "Starting Azure Functions runtime..."
         func start --host 0.0.0.0 --port 7071 &
-        sleep 30
+        
+        echo "Waiting for Functions to start up..."
+        sleep 45
+        
+        echo "Checking if Functions is responding..."
+        for i in {1..10}; do
+          if curl -s --connect-timeout 5 --max-time 10 http://localhost:7071/admin/host/ping > /dev/null 2>&1; then
+            echo "✓ Functions runtime is responding"
+            break
+          elif [ $i -eq 10 ]; then
+            echo "❌ Functions runtime failed to respond after 10 attempts"
+            echo "Checking processes:"
+            ps aux | grep -E "(func|dotnet)" || echo "No relevant processes found"
+            exit 1
+          else
+            echo "Attempt $i/10: Functions not ready yet, waiting..."
+            sleep 5
+          fi
+        done
       env:
         AzureWebJobsStorage: "UseDevelopmentStorage=true"
     
     - name: Test Agent Health Check
       run: |
         echo "Testing Agent Health Check endpoint..."
-        response=$(curl -s -o response.json -w "%{http_code}" http://localhost:7071/api/AgentHealthCheck)
+        echo "Checking if Functions runtime is running..."
+        
+        # Check if the process is running
+        if ps aux | grep -q "func.*start"; then
+          echo "✓ Azure Functions runtime is running"
+        else
+          echo "⚠️  Azure Functions runtime may not be running properly"
+          echo "Running processes:"
+          ps aux | grep -E "(func|dotnet)" || echo "No relevant processes found"
+        fi
+        
+        # Test connectivity with better error handling
+        echo "Testing health check endpoint connectivity..."
+        response=$(curl -s -o response.json -w "%{http_code}" --connect-timeout 10 --max-time 30 http://localhost:7071/api/AgentHealthCheck)
         echo "HTTP Status: $response"
+        echo "Response content:"
+        
+        if [ -f response.json ]; then
+          cat response.json
+        else
+          echo "No response file created"
+        fi
+        
         if [ "$response" -eq 200 ] || [ "$response" -eq 503 ]; then
           echo "✓ Health check endpoint responding"
-          cat response.json | jq '.'
+          if command -v jq &> /dev/null && [ -f response.json ]; then
+            echo "Formatted response:"
+            cat response.json | jq '.' || echo "Could not format JSON"
+          fi
         else
-          echo "✗ Health check endpoint failed"
-          cat response.json
+          echo "✗ Health check endpoint failed with status: $response"
+          echo "Checking service logs..."
+          # Try to get any relevant error information
+          if [ -f response.json ]; then
+            echo "Error response content:"
+            cat response.json
+          fi
           exit 1
         fi
     

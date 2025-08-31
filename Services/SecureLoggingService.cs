@@ -156,7 +156,7 @@ namespace RagSearch.Services
 
         private object[] RedactArgs(object[] args)
         {
-            return args.Select(RedactObject).ToArray();
+            return args.Select(RedactObject).ToArray()!;
         }
 
         private object? RedactObject(object? obj)

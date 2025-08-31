@@ -68,7 +68,7 @@ namespace RagSearch.Services
             return healthStatus.IsHealthy;
         }
 
-        public async Task<McpHealthStatus> GetDetailedHealthAsync(CancellationToken cancellationToken = default)
+        public Task<McpHealthStatus> GetDetailedHealthAsync(CancellationToken cancellationToken = default)
         {
             var startTime = DateTime.UtcNow;
             var healthStatus = new McpHealthStatus
@@ -86,7 +86,7 @@ namespace RagSearch.Services
                     healthStatus.IsHealthy = false;
                     healthStatus.Status = "Configuration Error";
                     healthStatus.ErrorMessage = "MCP server command not configured";
-                    return healthStatus;
+                    return Task.FromResult(healthStatus);
                 }
 
                 // Validate allowlists
@@ -121,7 +121,7 @@ namespace RagSearch.Services
             }
 
             _lastHealthStatus = healthStatus;
-            return healthStatus;
+            return Task.FromResult(healthStatus);
         }
     }
 }
