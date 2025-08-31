@@ -5,6 +5,8 @@ using RagSearch.Models;
 using RagSearch.Services;
 using System.Net;
 using System.Text.Json;
+using Microsoft.Azure.WebJobs.Extensions.OpenApi.Core.Attributes;
+using Microsoft.OpenApi.Models;
 
 namespace RagSearch.Functions;
 
@@ -23,17 +25,24 @@ public class SearchFunction
     }
 
     /// <summary>
-    /// HTTP endpoint for performing searches against the persistent index
+    /// HTTP GET endpoint for performing searches using query parameters
     /// </summary>
-    [Function("Search")]
-    public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Function, "get", "post")] HttpRequestData req)
+    [Function("SearchGet")]
+    [OpenApiOperation(operationId: "Search_Run_Get", tags: new[] { "Search" }, Summary = "Search documents (GET)", Description = "Performs keyword/hybrid searches over the persistent index using query parameters.")]
+    [OpenApiParameter(name: "q", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Query text", Description = "Search query text.")]
+    [OpenApiParameter(name: "type", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Search type", Description = "keyword|vector|hybrid")]
+    [OpenApiParameter(name: "content", In = ParameterLocation.Query, Required = false, Type = typeof(string), Summary = "Content types", Description = "Comma-separated content types (e.g., text,image)")]
+    [OpenApiParameter(name: "maxResults", In = ParameterLocation.Query, Required = false, Type = typeof(int), Summary = "Max results", Description = "Maximum results to return")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "application/json", bodyType: typeof(SearchResponse), Summary = "Search results", Description = "Search results payload.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.BadRequest, contentType: "text/plain", bodyType: typeof(string))]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.InternalServerError, contentType: "text/plain", bodyType: typeof(string))]
+    public async Task<HttpResponseData> Get(
+        [HttpTrigger(AuthorizationLevel.Function, "get", Route = "Search")] HttpRequestData req)
     {
-        _logger.LogInformation("Search function processing request");
+        _logger.LogInformation("Search GET processing request");
 
         try
         {
-            // Ensure the persistent index exists
             var indexExists = await _searchService.EnsureIndexExistsAsync();
             if (!indexExists)
             {
@@ -43,43 +52,18 @@ public class SearchFunction
                 return errorResponse;
             }
 
-            SearchRequest searchRequest;
-
-            if (req.Method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
+            var searchRequest = new SearchRequest
             {
-                // Handle GET request with query parameters
-                var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-                
-                searchRequest = new SearchRequest
-                {
-                    Query = query["q"] ?? string.Empty,
-                    SearchType = Enum.TryParse<SearchType>(query["type"], true, out var searchType) 
-                        ? searchType : SearchType.Keyword,
-                    ContentTypes = !string.IsNullOrEmpty(query["content"]) 
-                        ? query["content"]!.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                        : ["text", "image"],
-                    MaxResults = int.TryParse(query["maxResults"], out var maxResults) ? maxResults : 10
-                };
-            }
-            else
-            {
-                // Handle POST request with JSON body
-                string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
-                
-                if (string.IsNullOrEmpty(requestBody))
-                {
-                    var badRequestResponse = req.CreateResponse(HttpStatusCode.BadRequest);
-                    await badRequestResponse.WriteStringAsync("Request body is required for POST requests");
-                    return badRequestResponse;
-                }
+                Query = query["q"] ?? string.Empty,
+                SearchType = Enum.TryParse<SearchType>(query["type"], true, out var searchType)
+                    ? searchType : SearchType.Keyword,
+                ContentTypes = !string.IsNullOrEmpty(query["content"]) 
+                    ? query["content"]!.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    : ["text", "image"],
+                MaxResults = int.TryParse(query["maxResults"], out var maxResults) ? maxResults : 10
+            };
 
-                searchRequest = JsonSerializer.Deserialize<SearchRequest>(requestBody, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                }) ?? new SearchRequest();
-            }
-
-            // Validate search request
             if (string.IsNullOrEmpty(searchRequest.Query))
             {
                 var badRequestResponse = req.CreateResponse(HttpStatusCode.BadRequest);
@@ -87,39 +71,79 @@ public class SearchFunction
                 return badRequestResponse;
             }
 
-            _logger.LogInformation("Executing {SearchType} search for query: '{Query}'", 
-                searchRequest.SearchType, searchRequest.Query);
-
-            // Perform search against persistent index
             var searchResponse = await _searchService.SearchAsync(searchRequest);
 
-            // Return response
             var response = req.CreateResponse(HttpStatusCode.OK);
             response.Headers.Add("Content-Type", "application/json");
-            
-            var jsonOptions = new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                WriteIndented = true
-            };
-            
+            var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true };
             await response.WriteStringAsync(JsonSerializer.Serialize(searchResponse, jsonOptions));
-
-            _logger.LogInformation("Search completed successfully, returned {ResultCount} results in {ExecutionTime}ms", 
-                searchResponse.Results.Length, searchResponse.ExecutionTimeMs);
-
             return response;
-        }
-        catch (NotImplementedException ex)
-        {
-            _logger.LogWarning("Search type not yet implemented: {Message}", ex.Message);
-            var notImplementedResponse = req.CreateResponse(HttpStatusCode.NotImplemented);
-            await notImplementedResponse.WriteStringAsync($"Feature not yet implemented: {ex.Message}");
-            return notImplementedResponse;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error processing search request");
+            _logger.LogError(ex, "Error processing GET search request");
+            var errorResponse = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await errorResponse.WriteStringAsync("An error occurred while processing the search request");
+            return errorResponse;
+        }
+    }
+
+    /// <summary>
+    /// HTTP POST endpoint for performing searches using JSON body
+    /// </summary>
+    [Function("SearchPost")]
+    [OpenApiOperation(operationId: "Search_Run_Post", tags: new[] { "Search" }, Summary = "Search documents (POST)", Description = "Performs searches with rich options in the request body.")]
+    [OpenApiRequestBody(contentType: "application/json", bodyType: typeof(SearchRequest), Required = true, Description = "Search request body.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "application/json", bodyType: typeof(SearchResponse), Summary = "Search results", Description = "Search results payload.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.BadRequest, contentType: "text/plain", bodyType: typeof(string))]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.InternalServerError, contentType: "text/plain", bodyType: typeof(string))]
+    public async Task<HttpResponseData> Post(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "Search")] HttpRequestData req)
+    {
+        _logger.LogInformation("Search POST processing request");
+
+        try
+        {
+            var indexExists = await _searchService.EnsureIndexExistsAsync();
+            if (!indexExists)
+            {
+                _logger.LogError("Failed to ensure search index exists");
+                var errorResponse = req.CreateResponse(HttpStatusCode.InternalServerError);
+                await errorResponse.WriteStringAsync("Search service is not available");
+                return errorResponse;
+            }
+
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            if (string.IsNullOrEmpty(requestBody))
+            {
+                var badRequestResponse = req.CreateResponse(HttpStatusCode.BadRequest);
+                await badRequestResponse.WriteStringAsync("Request body is required for POST requests");
+                return badRequestResponse;
+            }
+
+            var searchRequest = JsonSerializer.Deserialize<SearchRequest>(requestBody, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            }) ?? new SearchRequest();
+
+            if (string.IsNullOrEmpty(searchRequest.Query))
+            {
+                var badRequestResponse = req.CreateResponse(HttpStatusCode.BadRequest);
+                await badRequestResponse.WriteStringAsync("Query is required");
+                return badRequestResponse;
+            }
+
+            var searchResponse = await _searchService.SearchAsync(searchRequest);
+
+            var response = req.CreateResponse(HttpStatusCode.OK);
+            response.Headers.Add("Content-Type", "application/json");
+            var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true };
+            await response.WriteStringAsync(JsonSerializer.Serialize(searchResponse, jsonOptions));
+            return response;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing POST search request");
             var errorResponse = req.CreateResponse(HttpStatusCode.InternalServerError);
             await errorResponse.WriteStringAsync("An error occurred while processing the search request");
             return errorResponse;
@@ -130,6 +154,9 @@ public class SearchFunction
     /// HTTP endpoint for getting search index status and statistics
     /// </summary>
     [Function("SearchStatus")]
+    [OpenApiOperation(operationId: "Search_Status", tags: new[] { "Search" }, Summary = "Index status", Description = "Gets status and statistics for the search index.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "application/json", bodyType: typeof(SearchStatusResponse), Summary = "Status info", Description = "Aggregated status and stats.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.InternalServerError, contentType: "text/plain", bodyType: typeof(string))]
     public async Task<HttpResponseData> GetStatus(
         [HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequestData req)
     {
@@ -140,7 +167,7 @@ public class SearchFunction
             // Get index statistics
             var stats = await _searchService.GetIndexStatisticsAsync();
             
-            var statusInfo = new
+            var statusInfo = new SearchStatusResponse
             {
                 IndexName = "ragsearch-documents",
                 DocumentCount = stats.DocumentCount,
@@ -148,7 +175,7 @@ public class SearchFunction
                 Status = "Available",
                 LastUpdated = DateTime.UtcNow,
                 PersistentStorage = true,
-                Features = new
+                Features = new SearchStatusFeatures
                 {
                     KeywordSearch = true,
                     VectorSearch = false, // Will be enabled when OpenAI service is added
@@ -187,6 +214,9 @@ public class SearchFunction
     /// WARNING: This will delete all existing data
     /// </summary>
     [Function("RebuildIndex")]
+    [OpenApiOperation(operationId: "Search_RebuildIndex", tags: new[] { "Search-Admin" }, Summary = "Rebuild index", Description = "Deletes and rebuilds the search index. Admin only.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "text/plain", bodyType: typeof(string), Summary = "Rebuilt", Description = "Index rebuilt successfully.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.InternalServerError, contentType: "text/plain", bodyType: typeof(string))]
     public async Task<HttpResponseData> RebuildIndex(
         [HttpTrigger(AuthorizationLevel.Admin, "post")] HttpRequestData req)
     {

@@ -5,6 +5,8 @@ using RagSearch.Models;
 using RagSearch.Services;
 using System.Net;
 using System.Text.Json;
+using Microsoft.Azure.WebJobs.Extensions.OpenApi.Core.Attributes;
+using Microsoft.OpenApi.Models;
 
 namespace RagSearch.Functions;
 
@@ -27,6 +29,8 @@ public class IndexTestFunction
     /// HTTP endpoint for adding sample test documents to the persistent index
     /// </summary>
     [Function("AddTestDocuments")]
+    [OpenApiOperation(operationId: "Test_AddDocuments", tags: new[] { "TestData" }, Summary = "Add test docs", Description = "Adds sample documents to the persistent index for testing.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "application/json", bodyType: typeof(object), Summary = "Indexed", Description = "Indexing result with counts.")]
     public async Task<HttpResponseData> AddTestDocuments(
         [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
     {
@@ -149,6 +153,8 @@ public class IndexTestFunction
     /// HTTP endpoint for clearing test documents from the persistent index
     /// </summary>
     [Function("ClearTestDocuments")]
+    [OpenApiOperation(operationId: "Test_ClearDocuments", tags: new[] { "TestData" }, Summary = "Clear test docs", Description = "Deletes the sample documents from the index.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "application/json", bodyType: typeof(object), Summary = "Cleared", Description = "Deletion result with counts.")]
     public async Task<HttpResponseData> ClearTestDocuments(
         [HttpTrigger(AuthorizationLevel.Function, "delete")] HttpRequestData req)
     {
@@ -205,6 +211,9 @@ public class IndexTestFunction
     /// HTTP endpoint for adding a custom document from URL content
     /// </summary>
     [Function("AddUrlDocument")]
+    [OpenApiOperation(operationId: "Test_AddUrlDocument", tags: new[] { "TestData" }, Summary = "Add URL doc", Description = "Adds a custom document provided in the request body.")]
+    [OpenApiRequestBody(contentType: "application/json", bodyType: typeof(CustomDocumentRequest), Required = true, Description = "Document payload.")]
+    [OpenApiResponseWithBody(statusCode: HttpStatusCode.OK, contentType: "application/json", bodyType: typeof(object), Summary = "Added", Description = "Indexing result for the custom document.")]
     public async Task<HttpResponseData> AddUrlDocument(
         [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
     {
